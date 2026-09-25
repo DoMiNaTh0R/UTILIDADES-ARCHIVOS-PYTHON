@@ -22,6 +22,7 @@ import codecs
 import copy
 import fnmatch
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -29,11 +30,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 
-from PyQt6.QtCore import QProcess, Qt, QThread, QUrl, pyqtSignal
+from PyQt6.QtCore import QProcess, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase,
                          QTextCharFormat, QTextCursor)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
@@ -1227,84 +1229,92 @@ class SelectorPython(QWidget):
 
 class Consola(QPlainTextEdit):
     """
-    Registro de solo lectura. 'agregar' escribe mensajes con hora y color;
-    'alimentar' recibe salida cruda de un proceso (maneja \\r y porcentajes de robocopy).
+    Registro de solo lectura. Todo lo que llega se acumula y se escribe en bloque
+    ~12 veces por segundo: así miles de líneas por segundo no congelan la interfaz.
+    'agregar' escribe mensajes con hora y color; 'alimentar' recibe la salida cruda
+    de un proceso (maneja \\r y los porcentajes de robocopy).
     """
     RE_PORCENTAJE = re.compile(r"^\s*\d+(\.\d+)?%\s*$")
+    RE_CORTE = re.compile(r"(\r\n|\n|\r)")
+    MAX_LINEAS = 20000
+    # Dibujar cada línea cuesta ~30 µs; por encima de esto se muestran solo las más
+    # recientes de cada tanda (nadie puede leer 20.000 líneas por segundo).
+    LIMITE_POR_VACIADO = 1500
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("consola")
         self.setReadOnly(True)
         self.setUndoRedoEnabled(False)
-        self.setMaximumBlockCount(50000)
+        self.setMaximumBlockCount(self.MAX_LINEAS)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self._linea = ""
-        self._pct = ""
-        self._tras_cr = False
+        self._pendiente: list[tuple] = []
+        self._formatos: dict[str, QTextCharFormat] = {}
+        self._reiniciar_linea()
+        self._cr_pendiente = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(80)
+        self._timer.timeout.connect(self._vaciar)
+
+    # ─── API ───
+    def agregar(self, texto: str, tipo: str = "normal"):
+        self._pendiente.append(("msg", str(texto), tipo, time.strftime("%H:%M:%S")))
+        self._programar()
+
+    def alimentar(self, texto: str):
+        if texto:
+            self._pendiente.append(("raw", texto))
+            self._programar()
+
+    def cerrar_linea(self):
+        self._pendiente.append(("fin",))
+        self._programar()
+
+    def limpiar(self):
+        self._pendiente.clear()
+        self.clear()
+        self._reiniciar_linea()
         self._cr_pendiente = False
 
-    @staticmethod
-    def _formato(tipo: str) -> QTextCharFormat:
-        f = QTextCharFormat()
-        color = COLOR_LOG.get(tipo)
-        if color:
-            f.setForeground(QColor(color))
-        if tipo == "titulo":
-            f.setFontWeight(QFont.Weight.Bold)
+    # ─── internos ───
+    def _programar(self):
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def _reiniciar_linea(self):
+        self._linea, self._pct, self._tras_cr = "", "", False
+
+    def _viva(self) -> str:
+        return self._linea + (f"   {self._pct.strip()}" if self._pct else "")
+
+    def _formato(self, tipo: str) -> QTextCharFormat:
+        f = self._formatos.get(tipo)
+        if f is None:
+            f = QTextCharFormat()
+            color = COLOR_LOG.get(tipo)
+            if color:
+                f.setForeground(QColor(color))
+            if tipo == "titulo":
+                f.setFontWeight(QFont.Weight.Bold)
+            self._formatos[tipo] = f
         return f
 
     def _al_final(self) -> bool:
         barra = self.verticalScrollBar()
         return barra.value() >= barra.maximum() - 4
 
-    def _bajar(self):
-        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
-
-    def _cursor_fin(self) -> QTextCursor:
-        c = QTextCursor(self.document())
-        c.movePosition(QTextCursor.MoveOperation.End)
-        return c
-
-    def _escribir_viva(self):
-        c = self._cursor_fin()
-        c.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
-        texto = self._linea + (f"   {self._pct.strip()}" if self._pct else "")
-        c.insertText(texto, QTextCharFormat())
-
-    def _nueva_linea(self):
-        self._cursor_fin().insertText("\n", QTextCharFormat())
-        self._linea, self._pct, self._tras_cr = "", "", False
-
-    def cerrar_linea(self):
-        self._cr_pendiente = False
-        if self._linea or self._pct:
-            self._escribir_viva()
-            self._nueva_linea()
-
-    def agregar(self, texto: str, tipo: str = "normal"):
-        abajo = self._al_final()
-        self.cerrar_linea()
-        hora = time.strftime("%H:%M:%S")
-        lineas = str(texto).splitlines() or [""]
-        for i, linea in enumerate(lineas):
-            c = self._cursor_fin()
-            c.insertText(f"[{hora}] " if i == 0 else " " * 11, self._formato("suave"))
-            c.insertText(linea, self._formato(tipo))
-            c.insertText("\n", QTextCharFormat())
-        if abajo:
-            self._bajar()
-
-    def alimentar(self, texto: str):
-        abajo = self._al_final()
+    def _procesar_crudo(self, texto: str) -> list[str]:
+        """Actualiza la línea en curso y devuelve las líneas que quedaron terminadas."""
         if self._cr_pendiente:
             texto, self._cr_pendiente = "\r" + texto, False
-        if texto.endswith("\r"):
+        if texto.endswith("\r"):  # puede ser la mitad de un \r\n: se decide con el siguiente trozo
             texto, self._cr_pendiente = texto[:-1], True
-        for parte in re.split(r"(\r\n|\n|\r)", texto):
+        terminadas = []
+        for parte in self.RE_CORTE.split(texto):
             if parte in ("\r\n", "\n"):
-                self._escribir_viva()
-                self._nueva_linea()
+                terminadas.append(self._viva())
+                self._reiniciar_linea()
             elif parte == "\r":
                 self._tras_cr = True
             elif parte:
@@ -1315,13 +1325,62 @@ class Consola(QPlainTextEdit):
                 else:
                     self._linea += parte
                 self._tras_cr = False
-        self._escribir_viva()
-        if abajo:
-            self._bajar()
+        return terminadas
 
-    def limpiar(self):
-        self.clear()
-        self._linea, self._pct, self._tras_cr, self._cr_pendiente = "", "", False, False
+    def _escribir_crudo(self, c: QTextCursor, terminadas: list[str]):
+        """Sustituye la última línea (la 'viva') por las terminadas + la nueva línea viva."""
+        if len(terminadas) > self.LIMITE_POR_VACIADO:
+            omitidas = len(terminadas) - self.LIMITE_POR_VACIADO
+            terminadas = [f"… {omitidas:,} líneas sin mostrar (llegan demasiado rápido)"] \
+                + terminadas[-self.LIMITE_POR_VACIADO:]
+        c.movePosition(QTextCursor.MoveOperation.End)
+        c.movePosition(QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor)
+        c.insertText("\n".join(terminadas + [self._viva()]), QTextCharFormat())
+
+    def _escribir_msg(self, c: QTextCursor, texto: str, tipo: str, hora: str):
+        c.movePosition(QTextCursor.MoveOperation.End)
+        for i, linea in enumerate(texto.splitlines() or [""]):
+            c.insertText(f"[{hora}] " if i == 0 else " " * 11, self._formato("suave"))
+            c.insertText(linea, self._formato(tipo))
+            c.insertText("\n", QTextCharFormat())
+
+    def _vaciar(self):
+        items, self._pendiente = self._pendiente, []
+        if not items:
+            return
+        # Si llegó una avalancha de mensajes, solo se muestran los últimos
+        sobran = len(items) - self.LIMITE_POR_VACIADO
+        omitidos = 0
+        while sobran > 0 and items[omitidos][0] == "msg":
+            omitidos += 1
+            sobran -= 1
+        if omitidos:
+            items = [("msg", f"… {omitidos:,} líneas sin mostrar (llegan demasiado rápido)", "suave",
+                      time.strftime("%H:%M:%S"))] + items[omitidos:]
+
+        abajo = self._al_final()
+        c = QTextCursor(self.document())
+        c.beginEditBlock()
+        terminadas: list[str] = []
+        for item in items:
+            if item[0] == "raw":
+                terminadas += self._procesar_crudo(item[1])
+                continue
+            # 'fin' o 'msg': primero se cierra la línea cruda que estuviera a medias
+            self._cr_pendiente = False
+            if self._linea or self._pct:
+                terminadas.append(self._viva())
+                self._reiniciar_linea()
+            if terminadas:
+                # La línea viva ya está vacía, así que esto termina en salto de línea
+                self._escribir_crudo(c, terminadas)
+                terminadas = []
+            if item[0] == "msg":
+                self._escribir_msg(c, item[1], item[2], item[3])
+        self._escribir_crudo(c, terminadas)
+        c.endEditBlock()
+        if abajo:
+            self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1329,9 +1388,11 @@ class Consola(QPlainTextEdit):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class Tarea(QThread):
-    """Ejecuta funcion(tarea, *args) en otro hilo. La función usa tarea.log/progreso/revisar."""
-    mensaje = pyqtSignal(str, str)
-    avance = pyqtSignal(int, int, str)
+    """
+    Ejecuta funcion(tarea, *args) en otro hilo. La función usa tarea.log/progreso/revisar.
+    Los mensajes y el progreso se guardan aquí y la página los recoge cada 100 ms
+    (en vez de una señal por línea, que satura la interfaz).
+    """
     listo = pyqtSignal(object)
     fallo = pyqtSignal(str)
     cancelado = pyqtSignal()
@@ -1340,7 +1401,9 @@ class Tarea(QThread):
         super().__init__(parent)
         self._funcion, self._args = funcion, args
         self.cancelada = False
-        self._ultimo = 0.0
+        self._lock = threading.Lock()
+        self._mensajes: list[tuple[str, str]] = []
+        self._avance: tuple | None = None
 
     def cancelar(self):
         self.cancelada = True
@@ -1350,13 +1413,17 @@ class Tarea(QThread):
             raise Cancelado()
 
     def log(self, texto: str, tipo: str = "normal"):
-        self.mensaje.emit(texto, tipo)
+        with self._lock:
+            self._mensajes.append((texto, tipo))
 
-    def progreso(self, actual: int, total: int, texto: str = "", forzar: bool = False):
-        ahora = time.monotonic()
-        if forzar or (total and actual >= total) or ahora - self._ultimo >= 0.05:
-            self._ultimo = ahora
-            self.avance.emit(actual, total, texto)
+    def progreso(self, actual: int, total: int, texto: str = ""):
+        self._avance = (actual, total, texto)
+
+    def tomar(self) -> tuple[list, tuple | None]:
+        with self._lock:
+            mensajes, self._mensajes = self._mensajes, []
+        avance, self._avance = self._avance, None
+        return mensajes, avance
 
     def run(self):
         try:
@@ -1381,6 +1448,7 @@ class Pagina(QWidget):
         self.config: Config = ventana.config
         self.tarea: Tarea | None = None
         self._acciones: list[QPushButton] = []
+        self.salio_bien = True   # la barra queda llena solo si la última operación terminó bien
 
         raiz = QHBoxLayout(self)
         raiz.setContentsMargins(SPACING_LG, SPACING_MD, SPACING_LG, SPACING_LG)
@@ -1464,10 +1532,11 @@ class Pagina(QWidget):
             b.setEnabled(not ocupado)
         self.btn_cancelar.setEnabled(ocupado)
         if ocupado:
+            self.salio_bien = True
             self.barra.setRange(0, 0)
         else:
             self.barra.setRange(0, 1)
-            self.barra.setValue(1)
+            self.barra.setValue(1 if self.salio_bien else 0)
             self.actualizar_acciones()
 
     def actualizar_acciones(self):
@@ -1478,15 +1547,28 @@ class Pagina(QWidget):
 
     def lanzar(self, funcion, args: tuple, al_terminar, texto_estado="Trabajando…"):
         self.tarea = t = Tarea(funcion, *args, parent=self)
-        t.mensaje.connect(self.consola.agregar)
-        t.avance.connect(self._avance)
-        t.listo.connect(al_terminar)
+        t.listo.connect(lambda r: (self._drenar(), al_terminar(r)))
         t.fallo.connect(self._fallo)
         t.cancelado.connect(self._cancelado)
         t.finished.connect(self._terminada)
+        if not hasattr(self, "_sondeo"):
+            self._sondeo = QTimer(self)
+            self._sondeo.setInterval(100)
+            self._sondeo.timeout.connect(self._drenar)
         self.estado(texto_estado)
         self.set_ocupado(True)
+        self._sondeo.start()
         t.start()
+
+    def _drenar(self):
+        """Pasa al registro y a la barra lo que la tarea fue dejando desde la última vez."""
+        if self.tarea is None:
+            return
+        mensajes, avance = self.tarea.tomar()
+        for texto, tipo in mensajes:
+            self.consola.agregar(texto, tipo)
+        if avance:
+            self._avance(*avance)
 
     def _avance(self, actual: int, total: int, texto: str):
         if total > 0:
@@ -1498,14 +1580,20 @@ class Pagina(QWidget):
             self.estado(texto)
 
     def _fallo(self, mensaje: str):
+        self.salio_bien = False
+        self._drenar()
         self.consola.agregar(mensaje, "error")
         self.estado("Terminó con error.")
 
     def _cancelado(self):
+        self.salio_bien = False
+        self._drenar()
         self.consola.agregar("Operación cancelada.", "aviso")
         self.estado("Cancelado.")
 
     def _terminada(self):
+        self._drenar()
+        self._sondeo.stop()
         if self.tarea is not None:
             self.tarea.deleteLater()
         self.tarea = None
@@ -1540,21 +1628,147 @@ HILOS_CPU = os.cpu_count() or 8
 # Robocopy usa 8 por defecto. Se escala con los hilos lógicos del PC, sin pasar de 32:
 # el límite real suele ser el disco, no la CPU.
 HILOS_RECOMENDADOS = max(8, min(32, HILOS_CPU))
+HILOS_USB = 4
+HILOS_HDD = 8
+# Para el tiempo restante cada archivo "cuesta" como 64 KB extra: copiar miles de
+# archivos pequeños tarda mucho más de lo que dicen sus bytes.
+COSTO_POR_ARCHIVO = 64 * 1024
 
 DEFAULT_COPIAR = {
     "origen": "",
     "destino": "",
+    "copiar_carpeta": True,
     "excluir_carpetas": [[".venv*", True], ["__pycache__", True], ["venv*", True], ["build*", True]],
     "excluir_archivos": [],
     "reintentos": 4,
     "espera": 5,
     "multihilo": True,
+    "hilos_auto": True,
     "hilos": HILOS_RECOMENDADOS,
+    "calcular_total": True,
     "simular": False,
     "sin_porcentaje": False,
+    "guardar_registro": False,
     "extra": "",
 }
+CARPETA_REGISTROS = carpeta_app() / "registros"
 
+
+def formatear_bytes(n: float) -> str:
+    for unidad in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:.0f} {unidad}" if unidad == "B" else f"{n:.1f} {unidad}"
+        n /= 1024
+    return f"{n:.2f} TB"
+
+
+def formatear_duracion(seg: float) -> str:
+    seg = int(max(seg, 0))
+    h, resto = divmod(seg, 3600)
+    m, s = divmod(resto, 60)
+    if h:
+        return f"{h} h {m:02d} min"
+    if m:
+        return f"{m} min {s:02d} s"
+    return f"{s} s"
+
+
+# ─── Tipo de disco (solo Windows) ───────────────────────────────────────────
+
+NOMBRES_TIPO_DISCO = {"usb": "USB / tarjeta", "hdd": "disco mecánico (HDD)", "ssd": "SSD",
+                      "red": "red", "desconocido": "tipo desconocido"}
+
+
+def info_unidad(ruta: str) -> dict | None:
+    """
+    {'unidad': 'E:', 'tipo': 'usb'|'hdd'|'ssd'|'red'|'desconocido', 'modelo': str}
+    Usa el bus del disco (IOCTL_STORAGE_QUERY_PROPERTY), así detecta también los discos
+    USB externos que Windows muestra como "fijos". None si no se puede saber.
+    """
+    if not ES_WINDOWS or not ruta:
+        return None
+    ruta = ntpath.abspath(ruta)
+    if ruta.startswith("\\\\"):
+        return {"unidad": "\\\\" + ruta.lstrip("\\").split("\\")[0], "tipo": "red", "modelo": ""}
+    unidad = ntpath.splitdrive(ruta)[0].upper()
+    if len(unidad) != 2:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+        k32.GetDriveTypeW.restype = wintypes.UINT
+        tipo_windows = k32.GetDriveTypeW(unidad + "\\")
+        if tipo_windows in (0, 1):      # desconocida / no existe
+            return None
+        if tipo_windows == 4:           # unidad de red mapeada
+            return {"unidad": unidad, "tipo": "red", "modelo": ""}
+
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                        wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                        wintypes.LPVOID]
+        k32.DeviceIoControl.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        # Acceso 0 = solo consultar (no necesita permisos de administrador)
+        h = k32.CreateFileW(f"\\\\.\\{unidad}", 0, 0x1 | 0x2, None, 3, 0, None)
+        if not h or h == ctypes.c_void_p(-1).value:
+            return {"unidad": unidad, "tipo": "usb" if tipo_windows == 2 else "desconocido", "modelo": ""}
+        try:
+            def consultar(propiedad: int, tamano: int) -> bytes | None:
+                consulta = (ctypes.c_ubyte * 12)()      # STORAGE_PROPERTY_QUERY
+                ctypes.c_uint32.from_buffer(consulta, 0).value = propiedad
+                salida = (ctypes.c_ubyte * tamano)()
+                devuelto = wintypes.DWORD(0)
+                ok = k32.DeviceIoControl(h, 0x002D1400, consulta, 12, salida, tamano,
+                                         ctypes.byref(devuelto), None)
+                return bytes(salida[:devuelto.value]) if ok else None
+
+            bus = modelo = None
+            d = consultar(0, 1024)                       # StorageDeviceProperty
+            if d and len(d) >= 32:
+                bus = int.from_bytes(d[28:32], "little")
+                partes = []
+                for off in (int.from_bytes(d[12:16], "little"), int.from_bytes(d[16:20], "little")):
+                    if 0 < off < len(d):
+                        partes.append(d[off:].split(b"\0", 1)[0].decode("ascii", "ignore").strip())
+                modelo = " ".join(p for p in partes if p)
+            penaliza = None
+            d = consultar(7, 12)                         # StorageDeviceSeekPenaltyProperty
+            if d and len(d) >= 9:
+                penaliza = bool(d[8])
+        finally:
+            k32.CloseHandle(h)
+
+        if bus in (7, 12, 13) or tipo_windows == 2:      # USB, SD, MMC o extraíble
+            tipo = "usb"
+        elif bus == 17 or penaliza is False:             # NVMe o sin penalización de búsqueda
+            tipo = "ssd"
+        elif penaliza:
+            tipo = "hdd"
+        else:
+            tipo = "desconocido"
+        return {"unidad": unidad, "tipo": tipo, "modelo": modelo or ""}
+    except Exception:
+        return None
+
+
+def hilos_segun_discos(infos: list) -> tuple[int, str]:
+    tipos = {i["tipo"] for i in infos if i}
+    if "usb" in tipos:
+        return HILOS_USB, "hay una unidad USB"
+    if "hdd" in tipos:
+        return HILOS_HDD, "hay un disco mecánico"
+    if not tipos:
+        return HILOS_RECOMENDADOS, f"tu PC tiene {HILOS_CPU} hilos lógicos"
+    return HILOS_RECOMENDADOS, f"discos rápidos y {HILOS_CPU} hilos lógicos"
+
+
+# ─── Robocopy: salida y progreso ────────────────────────────────────────────
 
 def describir_codigo_robocopy(codigo: int) -> tuple[str, str]:
     if codigo >= 16:
@@ -1581,13 +1795,100 @@ def limpiar_ruta_robocopy(r: str) -> str:
     return r
 
 
+# Filas del resumen final con 6 números (Total, Copiado, Omitido, No coinc., Error, Extras).
+# Se identifican por su orden (Carpetas, Archivos, Bytes), no por el texto, que cambia con el idioma.
+RE_RESUMEN = re.compile(r"^\s*[^\d\s][^:]*:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$")
+
+
+def leer_resumen_robocopy(texto: str) -> dict | None:
+    filas = [tuple(int(x) for x in m.groups())
+             for m in (RE_RESUMEN.match(linea) for linea in texto.splitlines()) if m]
+    if len(filas) < 3:
+        return None
+    archivos, bytes_ = filas[1], filas[2]
+    return {"archivos": archivos[1], "bytes": bytes_[1], "omitidos": archivos[2]}
+
+
+class ProgresoRobocopy:
+    """
+    Lee la salida de robocopy (con /BYTES) y lleva la cuenta de bytes y archivos copiados.
+    Cada línea de archivo trae su tamaño; el archivo anterior se da por terminado cuando
+    aparece el siguiente, y el % por archivo (sin /MT) afina el avance dentro de uno grande.
+    """
+    RE_ARCHIVO = re.compile(r"\t\s*(\d+)\t(.*\S)\s*$")
+    RE_GUIONES = re.compile(r"^\s*-{20,}\s*$")
+
+    def __init__(self, sin_cabecera: bool):
+        # Con cabecera, la lista de archivos va entre la 3.ª y la 4.ª línea de guiones
+        self._cuerpo = 0 if sin_cabecera else 3
+        self._guiones = 0
+        self._buffer = ""
+        self._actual: int | None = None
+        self._pct = 0.0
+        self.bytes_hechos = 0
+        self.archivos_hechos = 0
+
+    def alimentar(self, texto: str):
+        self._buffer += texto
+        partes = re.split(r"\r\n|\n|\r", self._buffer)
+        self._buffer = partes.pop()
+        for linea in partes:
+            self._linea(linea)
+        if Consola.RE_PORCENTAJE.match(self._buffer):
+            self._linea(self._buffer)
+            self._buffer = ""
+
+    def _linea(self, linea: str):
+        if Consola.RE_PORCENTAJE.match(linea):
+            try:
+                self._pct = float(linea.strip().rstrip("%"))
+            except ValueError:
+                pass
+            return
+        if self.RE_GUIONES.match(linea):
+            self._guiones += 1
+            return
+        if self._guiones != self._cuerpo:
+            return
+        m = self.RE_ARCHIVO.search(linea)
+        if not m or "*" in linea[:m.start()]:      # '*EXTRA': solo existe en el destino
+            return
+        if m.group(2).endswith(("\\", "/")):       # es una carpeta
+            return
+        self._cerrar_actual()
+        self._actual, self._pct = int(m.group(1)), 0.0
+
+    def _cerrar_actual(self):
+        if self._actual is not None:
+            self.bytes_hechos += self._actual
+            self.archivos_hechos += 1
+            self._actual = None
+
+    def terminar(self):
+        self._cerrar_actual()
+
+    def hechos(self) -> tuple[float, int]:
+        parcial = self._actual * min(self._pct, 100.0) / 100 if self._actual else 0
+        return self.bytes_hechos + parcial, self.archivos_hechos
+
+
 class PaginaCopiar(Pagina):
     def __init__(self, ventana):
         super().__init__(ventana, "Copiar con Robocopy",
                          "Copia una carpeta con todas sus subcarpetas omitiendo lo que no quieras. "
                          "La salida de robocopy se ve en vivo en el registro.")
         self.proceso: QProcess | None = None
+        self._fase: str | None = None           # 'calculo' | 'copia'
         self._cancelado = False
+        self._totales: dict | None = None
+        self._progreso: ProgresoRobocopy | None = None
+        self._muestras: deque = deque()
+        self._t_inicio = 0.0
+        self._salida_calculo: list[str] = []
+        self._args_copia: list[str] = []
+        self._cache_discos: dict[str, dict | None] = {}
+        self._archivo_registro = None
+        self._ruta_registro: Path | None = None
 
         self.sesiones = BarraSesiones(self.config, "copiar", DEFAULT_COPIAR, self.obtener_estado)
         self.sesiones.sesion_cargada.connect(self.aplicar_estado)
@@ -1601,6 +1902,10 @@ class PaginaCopiar(Pagina):
         lay.addWidget(etiqueta("DESTINO"))
         self.destino = SelectorRuta("carpeta", "Carpeta donde quedará la copia")
         lay.addWidget(self.destino)
+        self.chk_carpeta = QCheckBox("Copiar la carpeta completa, no solo su contenido (como Ctrl+C / Ctrl+V)")
+        lay.addWidget(self.chk_carpeta)
+        self.lbl_resultado = etiqueta("", "suave")
+        lay.addWidget(self.lbl_resultado)
         self.cuerpo.addWidget(card)
 
         # Exclusiones
@@ -1626,14 +1931,25 @@ class PaginaCopiar(Pagina):
         self.sp_espera.setSuffix(" s")
         self.chk_mt = QCheckBox("Multihilo (/MT)")
         self.chk_mt.setToolTip("Copia varios archivos a la vez. Más rápido con muchos archivos pequeños.")
+        fila_hilos = QHBoxLayout()
+        fila_hilos.setSpacing(SPACING_SM)
         self.sp_hilos = QSpinBox()
         self.sp_hilos.setRange(1, 128)
         self.sp_hilos.setSuffix(" hilos")
-        self.sp_hilos.setToolTip(
-            f"Tu PC tiene {HILOS_CPU} hilos lógicos; recomendado: {HILOS_RECOMENDADOS}.\n"
-            "Con discos mecánicos (HDD) conviene bajarlo a 4-8.")
+        self.chk_auto = QCheckBox("Automático según el disco")
+        self.chk_auto.setToolTip(f"USB o tarjeta: {HILOS_USB} · disco mecánico: {HILOS_HDD} · "
+                                 f"SSD/NVMe: {HILOS_RECOMENDADOS} (tu PC tiene {HILOS_CPU} hilos lógicos)")
+        fila_hilos.addWidget(self.sp_hilos, 1)
+        fila_hilos.addWidget(self.chk_auto)
+        self.lbl_discos = etiqueta("", "suave")
+        self.chk_total = QCheckBox("Calcular el total antes de copiar (para ver % y tiempo restante)")
+        self.chk_total.setToolTip("Hace una pasada rápida sin copiar nada (/L) para saber cuántos "
+                                  "archivos y bytes hay que copiar de verdad.")
         self.chk_simular = QCheckBox("Solo simular (/L): muestra qué haría sin copiar nada")
         self.chk_np = QCheckBox("Ocultar el % de cada archivo (/NP)")
+        self.chk_registro = QCheckBox("Guardar el registro completo en un .txt (carpeta «registros» junto a la app)")
+        self.chk_registro.setToolTip("Si robocopy va muy rápido, en pantalla solo se ven las últimas líneas; "
+                                     "el .txt guarda todas.")
         self.txt_extra = QLineEdit()
         self.txt_extra.setPlaceholderText("Parámetros extra, ej. /XO /XJ")
         g.addWidget(etiqueta("REINTENTOS (/R)"), 0, 0)
@@ -1641,13 +1957,14 @@ class PaginaCopiar(Pagina):
         g.addWidget(etiqueta("ESPERA ENTRE REINTENTOS (/W)"), 1, 0)
         g.addWidget(self.sp_espera, 1, 1)
         g.addWidget(self.chk_mt, 2, 0)
-        g.addWidget(self.sp_hilos, 2, 1)
-        g.addWidget(etiqueta(f"Tu PC tiene {HILOS_CPU} hilos lógicos · recomendado {HILOS_RECOMENDADOS} "
-                             "(en discos HDD mejor 4-8)", "suave"), 3, 1)
-        g.addWidget(self.chk_simular, 4, 0, 1, 2)
-        g.addWidget(self.chk_np, 5, 0, 1, 2)
-        g.addWidget(etiqueta("EXTRA"), 6, 0)
-        g.addWidget(self.txt_extra, 6, 1)
+        g.addLayout(fila_hilos, 2, 1)
+        g.addWidget(self.lbl_discos, 3, 1)
+        g.addWidget(self.chk_total, 4, 0, 1, 2)
+        g.addWidget(self.chk_simular, 5, 0, 1, 2)
+        g.addWidget(self.chk_np, 6, 0, 1, 2)
+        g.addWidget(self.chk_registro, 7, 0, 1, 2)
+        g.addWidget(etiqueta("EXTRA"), 8, 0)
+        g.addWidget(self.txt_extra, 8, 1)
         lay.addLayout(g)
         self.cuerpo.addWidget(card)
 
@@ -1667,13 +1984,28 @@ class PaginaCopiar(Pagina):
         self.btn_copiar.clicked.connect(self.iniciar)
         self.agregar_accion(self.btn_copiar)
 
-        for sig in (self.origen.cambiado, self.destino.cambiado, self.lista_carpetas.cambiado,
-                    self.lista_archivos.cambiado, self.sp_reintentos.valueChanged,
-                    self.sp_espera.valueChanged, self.chk_mt.toggled, self.sp_hilos.valueChanged,
-                    self.chk_simular.toggled, self.chk_np.toggled, self.txt_extra.textChanged):
+        # Timers: detección de discos (espera a que termines de escribir) y progreso
+        self._timer_discos = QTimer(self)
+        self._timer_discos.setSingleShot(True)
+        self._timer_discos.setInterval(400)
+        self._timer_discos.timeout.connect(self._detectar_discos)
+        self._reloj = QTimer(self)
+        self._reloj.setInterval(500)
+        self._reloj.timeout.connect(self._actualizar_progreso)
+
+        for sig in (self.origen.cambiado, self.destino.cambiado, self.chk_carpeta.toggled,
+                    self.lista_carpetas.cambiado, self.lista_archivos.cambiado,
+                    self.sp_reintentos.valueChanged, self.sp_espera.valueChanged, self.chk_mt.toggled,
+                    self.chk_auto.toggled, self.sp_hilos.valueChanged, self.chk_total.toggled,
+                    self.chk_simular.toggled, self.chk_np.toggled, self.chk_registro.toggled,
+                    self.txt_extra.textChanged):
             sig.connect(self._cambio)
+        for sig in (self.origen.cambiado, self.destino.cambiado, self.chk_carpeta.toggled):
+            sig.connect(lambda *_: self._timer_discos.start())
+        self.chk_auto.toggled.connect(lambda *_: self._detectar_discos())
 
         self.sesiones.cargar_inicial()
+        self._detectar_discos()
         self._cambio()
 
     # ─── estado / sesiones ───
@@ -1681,14 +2013,18 @@ class PaginaCopiar(Pagina):
         return {
             "origen": self.origen.texto(),
             "destino": self.destino.texto(),
+            "copiar_carpeta": self.chk_carpeta.isChecked(),
             "excluir_carpetas": self.lista_carpetas.valores(),
             "excluir_archivos": self.lista_archivos.valores(),
             "reintentos": self.sp_reintentos.value(),
             "espera": self.sp_espera.value(),
             "multihilo": self.chk_mt.isChecked(),
+            "hilos_auto": self.chk_auto.isChecked(),
             "hilos": self.sp_hilos.value(),
+            "calcular_total": self.chk_total.isChecked(),
             "simular": self.chk_simular.isChecked(),
             "sin_porcentaje": self.chk_np.isChecked(),
+            "guardar_registro": self.chk_registro.isChecked(),
             "extra": self.txt_extra.text().strip(),
         }
 
@@ -1698,32 +2034,101 @@ class PaginaCopiar(Pagina):
             self.origen.establecer(e["origen"])
         if e.get("destino"):
             self.destino.establecer(e["destino"])
+        self.chk_registro.setChecked(bool(e.get("guardar_registro")))
+        self.chk_carpeta.setChecked(bool(e.get("copiar_carpeta", True)))
         self.lista_carpetas.establecer(e.get("excluir_carpetas"))
         self.lista_archivos.establecer(e.get("excluir_archivos"))
         self.sp_reintentos.setValue(int(e.get("reintentos", 4)))
         self.sp_espera.setValue(int(e.get("espera", 5)))
-        self.chk_mt.setChecked(bool(e.get("multihilo")))
+        self.chk_mt.setChecked(bool(e.get("multihilo", True)))
+        self.chk_auto.setChecked(bool(e.get("hilos_auto", True)))
         self.sp_hilos.setValue(int(e.get("hilos", HILOS_RECOMENDADOS)))
+        self.chk_total.setChecked(bool(e.get("calcular_total", True)))
         self.chk_simular.setChecked(bool(e.get("simular")))
         self.chk_np.setChecked(bool(e.get("sin_porcentaje")))
         self.txt_extra.setText(e.get("extra", ""))
+        self._detectar_discos()
         self._cambio()
 
     def _cambio(self, *_):
         self.sesiones.marcar_modificado()
-        self.sp_hilos.setEnabled(self.chk_mt.isChecked())
+        self.chk_auto.setEnabled(self.chk_mt.isChecked())
+        self.sp_hilos.setEnabled(self.chk_mt.isChecked() and not self.chk_auto.isChecked())
+        self.chk_total.setEnabled(not self.chk_simular.isChecked())
+        destino = self.destino_efectivo()
+        if not destino:
+            self.lbl_resultado.setText("")
+        elif self.chk_carpeta.isChecked() and destino == limpiar_ruta_robocopy(self.destino.texto()):
+            self.lbl_resultado.setText("El origen es una unidad completa: se copiará su contenido.")
+        else:
+            self.lbl_resultado.setText(f"La copia quedará en: {destino}")
         self.lbl_comando.setText(self._comando_texto(self.argumentos()))
 
+    # ─── discos / hilos ───
+    def _info_disco(self, ruta: str, refrescar: bool = False) -> dict | None:
+        if not ruta:
+            return None
+        clave = ntpath.splitdrive(ntpath.abspath(ruta))[0].upper() if ES_WINDOWS else ruta
+        if refrescar or clave not in self._cache_discos:
+            self._cache_discos[clave] = info_unidad(ruta)
+        return self._cache_discos[clave]
+
+    def _detectar_discos(self, refrescar: bool = False):
+        infos = [self._info_disco(self.origen.texto(), refrescar),
+                 self._info_disco(self.destino.texto(), refrescar)]
+        hilos, motivo = hilos_segun_discos(infos)
+        partes = []
+        for nombre, info in (("Origen", infos[0]), ("Destino", infos[1])):
+            if info:
+                modelo = f" · {info['modelo']}" if info["modelo"] else ""
+                partes.append(f"{nombre} {info['unidad']}: {NOMBRES_TIPO_DISCO[info['tipo']]}{modelo}")
+        texto = " | ".join(partes) if partes else "No se pudo detectar el tipo de disco."
+        self.lbl_discos.setText(f"{texto}\nRecomendado: {hilos} hilos ({motivo}).")
+        if self.chk_auto.isChecked() and self.sp_hilos.value() != hilos:
+            # Cambio automático: no cuenta como modificación de la sesión
+            self.sp_hilos.blockSignals(True)
+            self.sp_hilos.setValue(hilos)
+            self.sp_hilos.blockSignals(False)
+            self.lbl_comando.setText(self._comando_texto(self.argumentos()))
+
     # ─── robocopy ───
-    def argumentos(self, extra_xd: list[str] | None = None) -> list[str]:
+    def destino_efectivo(self) -> str:
+        """Destino real: con 'carpeta completa' es <destino>\\<nombre de la carpeta de origen>."""
+        destino = limpiar_ruta_robocopy(self.destino.texto())
+        origen = limpiar_ruta_robocopy(self.origen.texto())
+        if not destino or not origen or not self.chk_carpeta.isChecked():
+            return destino
+        nombre = ntpath.basename(origen.rstrip("\\/"))
+        if not nombre or re.fullmatch(r"[A-Za-z]:", nombre):
+            return destino  # es una unidad (C:\): no hay carpeta que crear
+        return ntpath.join(destino, nombre)
+
+    def _base_args(self, extra_xd: list[str] | None = None) -> list[str]:
         args = [limpiar_ruta_robocopy(self.origen.texto()) or "<origen>",
-                limpiar_ruta_robocopy(self.destino.texto()) or "<destino>", "/E"]
+                self.destino_efectivo() or "<destino>", "/E"]
         carpetas = self.lista_carpetas.activos() + (extra_xd or [])
         if carpetas:
             args += ["/XD", *carpetas]
         archivos = self.lista_archivos.activos()
         if archivos:
             args += ["/XF", *archivos]
+        return args
+
+    def _extra_args(self) -> list[str]:
+        extra = self.txt_extra.text().strip()
+        if not extra:
+            return []
+        try:
+            partes = shlex.split(extra, posix=False)
+        except ValueError:
+            partes = extra.split()
+        return [p.strip('"') for p in partes if p.strip('"')]
+
+    def _con_progreso(self) -> bool:
+        return self.chk_total.isChecked() and not self.chk_simular.isChecked()
+
+    def argumentos(self, extra_xd: list[str] | None = None) -> list[str]:
+        args = self._base_args(extra_xd)
         args += [f"/R:{self.sp_reintentos.value()}", f"/W:{self.sp_espera.value()}"]
         if self.chk_mt.isChecked():
             args.append(f"/MT:{self.sp_hilos.value()}")
@@ -1733,21 +2138,25 @@ class PaginaCopiar(Pagina):
             args.append("/NP")
         if self.chk_simular.isChecked():
             args.append("/L")
-        extra = self.txt_extra.text().strip()
-        if extra:
-            try:
-                partes = shlex.split(extra, posix=False)
-            except ValueError:
-                partes = extra.split()
-            args += [p.strip('"') for p in partes if p.strip('"')]
-        return args
+        if self._con_progreso():
+            args.append("/BYTES")   # tamaños exactos en cada línea para calcular el avance
+        return args + self._extra_args()
+
+    def argumentos_calculo(self, extra_xd: list[str] | None = None) -> list[str]:
+        """Pasada rápida sin copiar ni listar archivos: solo el resumen con los totales."""
+        args = self._base_args(extra_xd)
+        args += ["/L", "/NFL", "/NDL", "/NJH", "/NP", "/BYTES", "/R:0", "/W:0"]
+        if self.chk_mt.isChecked():
+            args.append(f"/MT:{self.sp_hilos.value()}")
+        return args + self._extra_args()
 
     @staticmethod
     def _comando_texto(args: list[str]) -> str:
         return "robocopy " + " ".join(f'"{a}"' if " " in a else a for a in args)
 
     def iniciar(self):
-        origen, destino = self.origen.texto(), self.destino.texto()
+        origen = self.origen.texto()
+        destino = self.destino_efectivo()
         if not origen or not Path(origen).is_dir():
             self.error("La carpeta de origen no existe.")
             return
@@ -1765,61 +2174,204 @@ class PaginaCopiar(Pagina):
                 "se añadirá el destino a las carpetas omitidas.\n\n¿Continuar?")
             if r != QMessageBox.StandardButton.Yes:
                 return
-            extra_xd.append(limpiar_ruta_robocopy(destino))
+            extra_xd.append(destino)
         if not ES_WINDOWS:
             self.error("Robocopy solo está disponible en Windows.")
             return
 
-        args = self.argumentos(extra_xd)
+        self._detectar_discos(refrescar=True)   # por si conectaste otro USB con la misma letra
         self._cancelado = False
+        self._totales = None
+        self._progreso = None
+        self._args_copia = self.argumentos(extra_xd)
+        self.set_ocupado(True)
+        if self._con_progreso():
+            self._fase = "calculo"
+            self._salida_calculo = []
+            self.consola.agregar("Calculando cuánto hay que copiar…", "suave")
+            self.estado("Calculando el tamaño de la copia…")
+            self._lanzar_proceso(self.argumentos_calculo(extra_xd))
+        else:
+            self._arrancar_copia()
+
+    def _lanzar_proceso(self, args: list[str]):
         self._decoder = codecs.getincrementaldecoder(codificacion_consola())(errors="replace")
-        self.consola.agregar("▶ " + self._comando_texto(args), "titulo")
         self.proceso = QProcess(self)
         self.proceso.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.proceso.readyReadStandardOutput.connect(self._leer)
         self.proceso.finished.connect(self._terminado)
         self.proceso.errorOccurred.connect(self._error_proceso)
-        self.set_ocupado(True)
-        self.estado("Simulando…" if self.chk_simular.isChecked() else "Copiando…")
         self.proceso.start("robocopy", args)
+
+    def _arrancar_copia(self):
+        self._fase = "copia"
+        simular = self.chk_simular.isChecked()
+        if self._con_progreso():
+            extras = [a.upper() for a in self._extra_args()]
+            self._progreso = ProgresoRobocopy(sin_cabecera="/NJH" in extras)
+        self.consola.agregar("▶ " + self._comando_texto(self._args_copia), "titulo")
+        self.estado("Simulando…" if simular else "Copiando…")
+        self._abrir_registro()
+        self._t_inicio = time.monotonic()
+        self._muestras.clear()
+        if self._progreso is not None:
+            self._reloj.start()
+        self._lanzar_proceso(self._args_copia)
 
     def _leer(self):
         if self.proceso is None:
             return
-        datos = bytes(self.proceso.readAllStandardOutput())
-        self.consola.alimentar(self._decoder.decode(datos))
+        texto = self._decoder.decode(bytes(self.proceso.readAllStandardOutput()))
+        if self._fase == "calculo":
+            self._salida_calculo.append(texto)
+            return
+        if self._progreso is not None:
+            self._progreso.alimentar(texto)
+        if self._archivo_registro is not None:
+            self._archivo_registro.write(texto)
+        self.consola.alimentar(texto)
 
     def _terminado(self, codigo: int, estado_salida):
         resto = self._decoder.decode(b"", final=True)
         if resto:
-            self.consola.alimentar(resto)
-        self.consola.cerrar_linea()
+            if self._fase == "calculo":
+                self._salida_calculo.append(resto)
+            else:
+                self.consola.alimentar(resto)
+                if self._archivo_registro is not None:
+                    self._archivo_registro.write(resto)
+                if self._progreso is not None:
+                    self._progreso.alimentar(resto)
+        if self.proceso is not None:
+            self.proceso.deleteLater()
+            self.proceso = None
+
         if self._cancelado:
+            self.consola.cerrar_linea()
             self.consola.agregar("Copia cancelada por el usuario.", "aviso")
             self.estado("Cancelado.")
-        elif estado_salida == QProcess.ExitStatus.CrashExit:
+            self.salio_bien = False
+            self._fin()
+            return
+        if self._fase == "calculo":
+            self._calculo_listo(codigo)
+            return
+
+        self.consola.cerrar_linea()
+        if estado_salida == QProcess.ExitStatus.CrashExit:
             self.consola.agregar("Robocopy se cerró de forma inesperada.", "error")
             self.estado("Terminó con error.")
+            self.salio_bien = False
         else:
             tipo, texto = describir_codigo_robocopy(codigo)
             self.consola.agregar(texto, tipo)
             self.estado("Terminado." if tipo != "error" else "Terminó con errores.")
-        self._liberar()
+            self.salio_bien = tipo != "error"
+            self._resumen_final()
+        self._fin()
+
+    def _calculo_listo(self, codigo: int):
+        self._totales = leer_resumen_robocopy("".join(self._salida_calculo))
+        if codigo >= 16 or self._totales is None:
+            self.consola.agregar("No se pudo calcular el total; se copiará sin porcentaje.", "aviso")
+            self._totales = None
+        else:
+            t = self._totales
+            texto = f"Hay que copiar {t['archivos']:,} archivos ({formatear_bytes(t['bytes'])})"
+            if t["omitidos"]:
+                texto += f"; {t['omitidos']:,} ya están iguales en el destino y se saltan"
+            self.consola.agregar(texto + ".", "ok")
+        self._arrancar_copia()
+
+    def _resumen_final(self):
+        if self._progreso is None or self.chk_simular.isChecked():
+            return
+        self._progreso.terminar()
+        duracion = time.monotonic() - self._t_inicio
+        b, n = self._progreso.hechos()
+        velocidad = f" · promedio {formatear_bytes(b / duracion)}/s" if duracion >= 1 else ""
+        self.consola.agregar(f"Tiempo total: {formatear_duracion(duracion)} · {n:,} archivos · "
+                             f"{formatear_bytes(b)}{velocidad}", "ok")
+
+    def _actualizar_progreso(self):
+        if self._progreso is None or self._fase != "copia":
+            return
+        ahora = time.monotonic()
+        b, n = self._progreso.hechos()
+        trabajo = b + n * COSTO_POR_ARCHIVO
+        # Velocidad con los últimos ~20 s: reacciona a cambios (archivos grandes/pequeños)
+        self._muestras.append((ahora, trabajo, b))
+        while len(self._muestras) > 2 and ahora - self._muestras[0][0] > 20:
+            self._muestras.popleft()
+        t0, w0, b0 = self._muestras[0]
+        dt = ahora - t0
+
+        linea1, linea2 = [], []
+        tot = self._totales
+        if tot and (tot["bytes"] or tot["archivos"]):
+            if tot["bytes"]:
+                frac = b / tot["bytes"]
+            else:
+                frac = n / tot["archivos"]
+            frac = min(frac, 0.999)
+            self.barra.setRange(0, 1000)
+            self.barra.setValue(int(frac * 1000))
+            linea1 += [f"{frac * 100:.1f}%", f"{formatear_bytes(b)} de {formatear_bytes(tot['bytes'])}",
+                       f"{min(n, tot['archivos']):,} de {tot['archivos']:,} archivos"]
+            total_trabajo = tot["bytes"] + tot["archivos"] * COSTO_POR_ARCHIVO
+            velocidad_trabajo = (trabajo - w0) / dt if dt >= 3 else 0
+            if velocidad_trabajo > 0:
+                linea2.append(f"quedan ~{formatear_duracion(max(total_trabajo - trabajo, 0) / velocidad_trabajo)}")
+            else:
+                linea2.append("calculando tiempo restante…")
+        else:
+            linea1 += [formatear_bytes(b), f"{n:,} archivos"]
+        if dt >= 1:
+            linea2.append(f"{formatear_bytes((b - b0) / dt)}/s")
+        linea2.append(f"transcurrido {formatear_duracion(ahora - self._t_inicio)}")
+        self.estado(" · ".join(linea1) + "\n" + " · ".join(linea2))
 
     def _error_proceso(self, error):
         if error == QProcess.ProcessError.FailedToStart:
             self.consola.agregar("No se pudo iniciar robocopy. ¿Estás en Windows?", "error")
             self.estado("Error.")
-            self._liberar()
+            self.salio_bien = False
+            if self.proceso is not None:
+                self.proceso.deleteLater()
+                self.proceso = None
+            self._fin()
 
-    def _liberar(self):
-        if self.proceso is not None:
-            self.proceso.deleteLater()
-        self.proceso = None
+    def _abrir_registro(self):
+        self._archivo_registro = self._ruta_registro = None
+        if not self.chk_registro.isChecked():
+            return
+        ruta = CARPETA_REGISTROS / time.strftime("robocopy_%Y-%m-%d_%H-%M-%S.txt")
+        try:
+            ruta.parent.mkdir(parents=True, exist_ok=True)
+            self._archivo_registro = open(ruta, "w", encoding="utf-8", newline="")
+            self._archivo_registro.write(self._comando_texto(self._args_copia) + "\r\n\r\n")
+            self._ruta_registro = ruta
+        except OSError as e:
+            self.consola.agregar(f"No se pudo crear el registro en «{ruta}»: {e}", "aviso")
+
+    def _cerrar_registro(self):
+        if self._archivo_registro is None:
+            return
+        try:
+            self._archivo_registro.close()
+            self.consola.agregar(f"Registro completo guardado en «{self._ruta_registro}».", "ok")
+        except OSError as e:
+            self.consola.agregar(f"No se pudo guardar el registro: {e}", "aviso")
+        self._archivo_registro = None
+
+    def _fin(self):
+        self._reloj.stop()
+        self._cerrar_registro()
+        self._fase = None
         self.set_ocupado(False)
 
     def ocupada(self) -> bool:
-        return self.proceso is not None
+        return self.proceso is not None or self._fase is not None
 
     def cancelar(self):
         if self.proceso is not None:
@@ -2867,6 +3419,7 @@ class VentanaPrincipal(QMainWindow):
         self.app.setStyleSheet(construir_qss(p, preparar_iconos(p, tema),
                                              self.f_cuerpo, self.f_titulo, self.f_mono))
         self.btn_tema.setText("☀  Tema claro" if tema == "oscuro" else "☾  Tema oscuro")
+        self.btn_tema.setMinimumWidth(self.btn_tema.sizeHint().width() + SPACING_MD)
 
     def alternar_tema(self):
         self.aplicar_tema("claro" if self.config.datos["tema"] == "oscuro" else "oscuro")

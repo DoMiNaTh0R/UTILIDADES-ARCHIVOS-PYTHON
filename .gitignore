@@ -12,3 +12,4 @@ dist/
 # Temporales de la app
 *.json.tmp
 *.json.bak
+utilidades_archivos/registros/

@@ -5,7 +5,8 @@ App de escritorio (PyQt6) que junta en una sola ventana varias utilidades que an
 ```
 utilidades_archivos/
 ├── utilidades_archivos.py     ← la app
-└── utilidades_config.json     ← tema, sesiones guardadas, último venv… (se actualiza sola)
+├── utilidades_config.json     ← tema, sesiones guardadas, último venv… (se actualiza sola)
+└── registros/                 ← registros completos de robocopy (solo si activas la opción)
 legacy/                        ← scripts originales, solo como referencia
 ```
 
@@ -22,7 +23,7 @@ Con `pythonw` en lugar de `python` se abre sin la ventana de consola.
 
 | Pestaña | Qué hace | Script original |
 |---|---|---|
-| **Copiar** | Robocopy con carpetas (`/XD`) y archivos (`/XF`) a omitir, reintentos, multihilo (`/MT`), simulación (`/L`) y salida en vivo. Sesiones con nombre. | `copiar.bat` |
+| **Copiar** | Robocopy con carpetas (`/XD`) y archivos (`/XF`) a omitir, reintentos, simulación (`/L`) y salida en vivo. Copia la carpeta completa (como Ctrl+C / Ctrl+V) o solo su contenido. Muestra %, velocidad y tiempo restante. Multihilo (`/MT`) automático según el disco: USB 4 hilos, HDD 8, SSD según tu CPU. Sesiones con nombre. | `copiar.bat` |
 | **Organizar** | Escanea una carpeta (recursivo), cuenta archivos por extensión y mueve o copia las marcadas a `<destino>/<extensión>/`. Nunca sobrescribe. | `Filtrador_y_movedor_de_archivos V2.py` |
 | **Listar rutas** | `.txt` con las rutas de archivos y/o carpetas (recursivo). Filtro *Todo / Solo estas / Excluir estas* extensiones y carpetas a ignorar. Sesiones con nombre. | `Sacar rutas de subcarpetas.py` |
 | **Info entorno** | Versión de Python y de cada paquete de un venv o del Python global; guarda un único `requirements.txt` (pip freeze). | `info_entorno.py` |
