@@ -35,10 +35,10 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 
-from PyQt6.QtCore import QProcess, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QByteArray, QProcess, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase,
                          QTextCharFormat, QTextCursor)
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
+from PyQt6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QApplication, QButtonGroup,
                              QCheckBox, QComboBox, QFileDialog, QFrame,
                              QGridLayout, QHBoxLayout, QHeaderView,
                              QInputDialog, QLabel, QLineEdit, QListWidget,
@@ -843,6 +843,38 @@ def refrescar_estilo(w: QWidget):
     w.style().polish(w)
 
 
+def pasar_rueda_a_pagina(widget: QWidget, e):
+    """Manda la rueda del mouse a la barra de desplazamiento de la página que contiene al widget."""
+    padre = widget.parentWidget()
+    while padre is not None and not isinstance(padre, QAbstractScrollArea):
+        padre = padre.parentWidget()
+    if padre is not None:
+        QApplication.sendEvent(padre.verticalScrollBar(), e)
+    e.accept()
+
+
+class SpinSinRueda(QSpinBox):
+    """QSpinBox que ignora la rueda del mouse: al desplazarte por la página no cambia de valor."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, e):
+        pasar_rueda_a_pagina(self, e)
+
+
+class ComboSinRueda(QComboBox):
+    """QComboBox que ignora la rueda del mouse (igual que SpinSinRueda)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, e):
+        pasar_rueda_a_pagina(self, e)
+
+
 class CampoRuta(QLineEdit):
     """QLineEdit que acepta arrastrar carpetas/archivos desde el explorador."""
 
@@ -1031,7 +1063,7 @@ class BarraSesiones(QFrame):
         fila = QHBoxLayout()
         fila.setSpacing(SPACING_SM)
         fila.addWidget(etiqueta("SESIÓN"))
-        self.combo = QComboBox()
+        self.combo = ComboSinRueda()
         self.combo.setMinimumWidth(120)
         self.combo.currentTextChanged.connect(self._al_cambiar)
         fila.addWidget(self.combo, 1)
@@ -1924,16 +1956,16 @@ class PaginaCopiar(Pagina):
         # Opciones
         card, lay = tarjeta("Opciones")
         g = grid_opciones()
-        self.sp_reintentos = QSpinBox()
+        self.sp_reintentos = SpinSinRueda()
         self.sp_reintentos.setRange(0, 9999)
-        self.sp_espera = QSpinBox()
+        self.sp_espera = SpinSinRueda()
         self.sp_espera.setRange(0, 3600)
         self.sp_espera.setSuffix(" s")
         self.chk_mt = QCheckBox("Multihilo (/MT)")
         self.chk_mt.setToolTip("Copia varios archivos a la vez. Más rápido con muchos archivos pequeños.")
         fila_hilos = QHBoxLayout()
         fila_hilos.setSpacing(SPACING_SM)
-        self.sp_hilos = QSpinBox()
+        self.sp_hilos = SpinSinRueda()
         self.sp_hilos.setRange(1, 128)
         self.sp_hilos.setSuffix(" hilos")
         self.chk_auto = QCheckBox("Automático según el disco")
@@ -3361,8 +3393,8 @@ class VentanaPrincipal(QMainWindow):
         super().__init__()
         self.app, self.config = app, config
         self.setWindowTitle(APP_NOMBRE)
-        self.resize(1320, 860)
-        self.setMinimumSize(1000, 640)
+        self.setMinimumSize(900, 560)
+        self._ajustar_a_pantalla()
 
         self.f_cuerpo = elegir_fuente(FUENTES_CUERPO)
         self.f_titulo = elegir_fuente(FUENTES_TITULO)
@@ -3425,6 +3457,25 @@ class VentanaPrincipal(QMainWindow):
         self.aplicar_tema("claro" if self.config.datos["tema"] == "oscuro" else "oscuro")
         self.config.guardar()
 
+    def _ajustar_a_pantalla(self):
+        """Tamaño inicial que siempre cabe en la pantalla (o el último que usaste)."""
+        geometria = self.config.datos.get("ventana")
+        if isinstance(geometria, str) and geometria:
+            try:
+                if self.restoreGeometry(QByteArray.fromBase64(geometria.encode("ascii"))):
+                    return
+            except Exception:
+                pass
+        pantalla = QApplication.primaryScreen()
+        if pantalla is None:
+            self.resize(1280, 800)
+            return
+        area = pantalla.availableGeometry()
+        ancho = min(1320, int(area.width() * 0.92))
+        alto = min(860, int(area.height() * 0.90))
+        self.resize(ancho, alto)
+        self.move(area.x() + (area.width() - ancho) // 2, area.y() + (area.height() - alto) // 2)
+
     def closeEvent(self, e):
         ocupadas = [n for n, p in self.paginas if p.ocupada()]
         if ocupadas:
@@ -3439,6 +3490,7 @@ class VentanaPrincipal(QMainWindow):
             for _, p in self.paginas:
                 p.esperar()
         self.config.datos["pestana"] = self.tabs.currentIndex()
+        self.config.datos["ventana"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
         self.config.guardar()
         e.accept()
 
