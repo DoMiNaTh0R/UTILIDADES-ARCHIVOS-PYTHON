@@ -1536,6 +1536,11 @@ def grid_opciones() -> QGridLayout:
 # 1. COPIAR (ROBOCOPY)
 # ═════════════════════════════════════════════════════════════════════════════
 
+HILOS_CPU = os.cpu_count() or 8
+# Robocopy usa 8 por defecto. Se escala con los hilos lógicos del PC, sin pasar de 32:
+# el límite real suele ser el disco, no la CPU.
+HILOS_RECOMENDADOS = max(8, min(32, HILOS_CPU))
+
 DEFAULT_COPIAR = {
     "origen": "",
     "destino": "",
@@ -1543,8 +1548,8 @@ DEFAULT_COPIAR = {
     "excluir_archivos": [],
     "reintentos": 4,
     "espera": 5,
-    "multihilo": False,
-    "hilos": 8,
+    "multihilo": True,
+    "hilos": HILOS_RECOMENDADOS,
     "simular": False,
     "sin_porcentaje": False,
     "extra": "",
@@ -1624,6 +1629,9 @@ class PaginaCopiar(Pagina):
         self.sp_hilos = QSpinBox()
         self.sp_hilos.setRange(1, 128)
         self.sp_hilos.setSuffix(" hilos")
+        self.sp_hilos.setToolTip(
+            f"Tu PC tiene {HILOS_CPU} hilos lógicos; recomendado: {HILOS_RECOMENDADOS}.\n"
+            "Con discos mecánicos (HDD) conviene bajarlo a 4-8.")
         self.chk_simular = QCheckBox("Solo simular (/L): muestra qué haría sin copiar nada")
         self.chk_np = QCheckBox("Ocultar el % de cada archivo (/NP)")
         self.txt_extra = QLineEdit()
@@ -1634,10 +1642,12 @@ class PaginaCopiar(Pagina):
         g.addWidget(self.sp_espera, 1, 1)
         g.addWidget(self.chk_mt, 2, 0)
         g.addWidget(self.sp_hilos, 2, 1)
-        g.addWidget(self.chk_simular, 3, 0, 1, 2)
-        g.addWidget(self.chk_np, 4, 0, 1, 2)
-        g.addWidget(etiqueta("EXTRA"), 5, 0)
-        g.addWidget(self.txt_extra, 5, 1)
+        g.addWidget(etiqueta(f"Tu PC tiene {HILOS_CPU} hilos lógicos · recomendado {HILOS_RECOMENDADOS} "
+                             "(en discos HDD mejor 4-8)", "suave"), 3, 1)
+        g.addWidget(self.chk_simular, 4, 0, 1, 2)
+        g.addWidget(self.chk_np, 5, 0, 1, 2)
+        g.addWidget(etiqueta("EXTRA"), 6, 0)
+        g.addWidget(self.txt_extra, 6, 1)
         lay.addLayout(g)
         self.cuerpo.addWidget(card)
 
@@ -1693,7 +1703,7 @@ class PaginaCopiar(Pagina):
         self.sp_reintentos.setValue(int(e.get("reintentos", 4)))
         self.sp_espera.setValue(int(e.get("espera", 5)))
         self.chk_mt.setChecked(bool(e.get("multihilo")))
-        self.sp_hilos.setValue(int(e.get("hilos", 8)))
+        self.sp_hilos.setValue(int(e.get("hilos", HILOS_RECOMENDADOS)))
         self.chk_simular.setChecked(bool(e.get("simular")))
         self.chk_np.setChecked(bool(e.get("sin_porcentaje")))
         self.txt_extra.setText(e.get("extra", ""))
