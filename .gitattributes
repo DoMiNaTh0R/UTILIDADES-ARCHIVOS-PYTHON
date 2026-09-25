@@ -1,0 +1,2 @@
+# Los .bat necesitan CRLF: con LF, cmd puede fallar en los goto
+*.bat text eol=crlf

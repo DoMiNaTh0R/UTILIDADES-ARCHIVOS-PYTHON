@@ -13,3 +13,9 @@ dist/
 *.json.tmp
 *.json.bak
 utilidades_archivos/registros/
+
+# Datos locales de la app (se crean solos junto al script o al .exe)
+utilidades_archivos/utilidades_config.json
+fallo_grave.log
+autoprueba.json
+autoprueba_pasos.txt

@@ -9,11 +9,16 @@ Pestañas:
                          con filtro de extensiones y carpetas a ignorar.
     4. Info entorno      Versiones de paquetes de un venv o del Python global -> requirements.txt.
     5. Licencias         THIRD_PARTY_NOTICES.txt con las licencias de un venv o del Python global.
+    6. Acerca de         Versión, creador y datos de la app.
 
 La configuración (tema, sesiones guardadas, último venv...) vive en
-'utilidades_config.json', junto a este script.
+'utilidades_config.json', junto a este script o al .exe compilado (si esa carpeta no
+se puede escribir, en %LOCALAPPDATA%\\UtilidadesArchivos).
 
 Requisitos: Python 3.9+ y PyQt6  (pip install PyQt6)
+
+Compila igual con PyInstaller y con Nuitka (ver compilar.py). Tras compilar:
+    UtilidadesArchivos.exe --autoprueba    prueba sin ventana y deja autoprueba.json
 """
 
 from __future__ import annotations
@@ -35,9 +40,10 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QProcess, Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase,
-                         QTextCharFormat, QTextCursor)
+from PyQt6.QtCore import (PYQT_VERSION_STR, QT_VERSION_STR, QByteArray, QElapsedTimer, QProcess,
+                          QSize, Qt, QThread, QTimer, QUrl, pyqtSignal)
+from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QPainter,
+                         QPainterPath, QPixmap, QTextCharFormat, QTextCursor)
 from PyQt6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QApplication, QButtonGroup,
                              QCheckBox, QComboBox, QFileDialog, QFrame,
                              QGridLayout, QHBoxLayout, QHeaderView,
@@ -48,18 +54,83 @@ from PyQt6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QApplicatio
                              QSplitter, QTableWidget, QTableWidgetItem,
                              QTabWidget, QVBoxLayout, QWidget)
 
+# Datos de la app: los scripts de compilación los leen de aquí (sin importar PyQt6)
 APP_NOMBRE = "Utilidades de archivos"
+APP_ID = "UtilidadesArchivos"            # nombre del .exe y de la carpeta de datos alternativa
+APP_VERSION = "1.0.0"
+APP_AUTOR = "DoMiNaTh0R"
+APP_AUTOR_NOMBRE = "Kevin González"
+APP_ANIO = "2026"
+APP_REPO = "https://github.com/DoMiNaTh0R/CLAUDE-UTILIDADES-ARCHIVOS"
+APP_USER_MODEL_ID = "DoMiNaTh0R.UtilidadesArchivos"
+
 ES_WINDOWS = sys.platform.startswith("win")
 
 
-def carpeta_app() -> Path:
-    """Carpeta donde vive el script (o el .exe si se empaqueta con PyInstaller)."""
+# ─── Rutas (código fuente, PyInstaller y Nuitka) ────────────────────────────
+
+def forma_de_ejecucion() -> str:
     if getattr(sys, "frozen", False):
+        return "PyInstaller"
+    if "__compiled__" in globals():
+        return "Nuitka"
+    return "Código fuente"
+
+
+def carpeta_app() -> Path:
+    """Carpeta real del script o del .exe (en un onefile, la del .exe, no la temporal)."""
+    if getattr(sys, "frozen", False):                      # PyInstaller
         return Path(sys.executable).resolve().parent
+    compilado = globals().get("__compiled__")
+    if compilado is not None:                              # Nuitka: __file__ apunta a la
+        contenedora = getattr(compilado, "containing_dir", None)   # carpeta de extracción
+        if contenedora:
+            return Path(contenedora)
+        return Path(sys.argv[0]).resolve().parent
     return Path(__file__).resolve().parent
 
 
-CONFIG_PATH = carpeta_app() / "utilidades_config.json"
+def carpeta_recursos() -> Path:
+    """recursos\\ (logo, avatar, icono): dentro del paquete compilado o junto al script."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    base = Path(meipass) if meipass else Path(__file__).resolve().parent
+    return base / "recursos"
+
+
+def recurso(nombre: str) -> Path:
+    return carpeta_recursos() / nombre
+
+
+def _se_puede_escribir(carpeta: Path) -> bool:
+    try:
+        carpeta.mkdir(parents=True, exist_ok=True)
+        prueba = carpeta / f".prueba_escritura_{os.getpid()}"
+        prueba.write_bytes(b"")
+        prueba.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def carpeta_datos() -> Path:
+    """
+    Dónde van la configuración y los registros: junto a la app (portable) o, si esa
+    carpeta no se puede escribir (ej. Archivos de programa), en %LOCALAPPDATA%.
+    La variable UTILIDADES_DATOS la cambia (la usa la autoprueba).
+    """
+    if os.environ.get("UTILIDADES_DATOS"):
+        return Path(os.environ["UTILIDADES_DATOS"])
+    if "--autoprueba" in sys.argv:          # nunca toca tu configuración real
+        return Path(tempfile.gettempdir()) / f"{APP_ID}_autoprueba"
+    junto = carpeta_app()
+    if (junto / "utilidades_config.json").exists() or _se_puede_escribir(junto):
+        return junto
+    local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(local) / APP_ID
+
+
+CARPETA_DATOS = carpeta_datos()
+CONFIG_PATH = CARPETA_DATOS / "utilidades_config.json"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -227,6 +298,19 @@ QLabel[class="comando"] {{
     padding: {SPACING_SM}px;
 }}
 QLabel[class="dato"] {{ font-weight: 600; }}
+QLabel[class="version"] {{
+    font-size: {TXT_LABEL_MD}px;
+    font-weight: 600;
+    color: {p['texto_primario_suave']};
+    background-color: {p['primario_suave']};
+    border-radius: {RADIUS_DEFAULT}px;
+    padding: 2px {SPACING_SM}px;
+}}
+QLabel[class="autor"] {{
+    font-family: '{f_titulo}';
+    font-size: {TXT_HEADLINE_SM}px;
+    font-weight: 700;
+}}
 
 /* ─── Cards ──────────────────────────────────────── */
 QFrame[class="card"] {{
@@ -276,6 +360,15 @@ QPushButton[class="fantasma"] {{
 }}
 QPushButton[class="fantasma"]:hover {{ background-color: {p['superficie_alta']}; color: {p['texto']}; }}
 QPushButton[class="fantasma"]:disabled {{ background: transparent; color: {p['deshabilitado_texto']}; }}
+QPushButton[class="creador"] {{
+    background: transparent;
+    border: 1px solid {p['borde']};
+    border-radius: 16px;
+    color: {p['texto']};
+    padding: 3px {SPACING_MD - 4}px 3px 4px;
+    text-align: left;
+}}
+QPushButton[class="creador"]:hover {{ background-color: {p['superficie_baja']}; border-color: {p['borde_fuerte']}; }}
 QPushButton[class="peligro"] {{
     background-color: transparent;
     color: {p['peligro']};
@@ -491,6 +584,7 @@ class Config:
     def guardar(self):
         tmp = self.ruta.with_name(self.ruta.name + ".tmp")
         try:
+            self.ruta.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(self.datos, fh, ensure_ascii=False, indent=2)
             os.replace(tmp, self.ruta)
@@ -836,6 +930,48 @@ def etiqueta(texto: str, clase: str = "etiqueta") -> QLabel:
     lbl.setProperty("class", clase)
     lbl.setWordWrap(True)
     return lbl
+
+
+_CACHE_IMAGENES: dict[str, QPixmap] = {}
+
+
+def imagen(nombre: str) -> QPixmap:
+    """Imagen de recursos\\ (se lee una sola vez). Si falta, un pixmap nulo: la app sigue igual."""
+    if nombre not in _CACHE_IMAGENES:
+        _CACHE_IMAGENES[nombre] = QPixmap(str(recurso(nombre)))
+    return _CACHE_IMAGENES[nombre]
+
+
+def pixmap_escalado(nombre: str, lado: int, dpr: float = 1.0) -> QPixmap:
+    original = imagen(nombre)
+    if original.isNull():
+        return QPixmap()
+    px = original.scaled(int(lado * dpr), int(lado * dpr), Qt.AspectRatioMode.KeepAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
+    px.setDevicePixelRatio(dpr)
+    return px
+
+
+def pixmap_circular(nombre: str, lado: int, dpr: float = 1.0) -> QPixmap:
+    """Recorte circular (para el avatar del creador)."""
+    original = imagen(nombre)
+    if original.isNull():
+        return QPixmap()
+    tam = int(lado * dpr)
+    cuadrado = original.scaled(tam, tam, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                               Qt.TransformationMode.SmoothTransformation)
+    salida = QPixmap(tam, tam)
+    salida.fill(Qt.GlobalColor.transparent)
+    p = QPainter(salida)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    camino = QPainterPath()
+    camino.addEllipse(0, 0, tam, tam)
+    p.setClipPath(camino)
+    p.drawPixmap((tam - cuadrado.width()) // 2, (tam - cuadrado.height()) // 2, cuadrado)
+    p.end()
+    salida.setDevicePixelRatio(dpr)
+    return salida
 
 
 def refrescar_estilo(w: QWidget):
@@ -1683,7 +1819,7 @@ DEFAULT_COPIAR = {
     "guardar_registro": False,
     "extra": "",
 }
-CARPETA_REGISTROS = carpeta_app() / "registros"
+CARPETA_REGISTROS = CARPETA_DATOS / "registros"
 
 
 def formatear_bytes(n: float) -> str:
@@ -1905,6 +2041,10 @@ class ProgresoRobocopy:
 
 
 class PaginaCopiar(Pagina):
+    # Resultado de la detección de discos, que corre en otro hilo: consultar un disco
+    # dormido o una unidad de red puede tardar segundos y congelaría la ventana.
+    discos_detectados = pyqtSignal(dict, int)
+
     def __init__(self, ventana):
         super().__init__(ventana, "Copiar con Robocopy",
                          "Copia una carpeta con todas sus subcarpetas omitiendo lo que no quieras. "
@@ -1919,6 +2059,9 @@ class PaginaCopiar(Pagina):
         self._salida_calculo: list[str] = []
         self._args_copia: list[str] = []
         self._cache_discos: dict[str, dict | None] = {}
+        self._gen_discos = self._gen_mostrada = 0   # se muestra solo la última detección pedida
+        self._tras_discos = None                # qué hacer cuando termine (iniciar la copia)
+        self.discos_detectados.connect(self._discos_listos)
         self._archivo_registro = None
         self._ruta_registro: Path | None = None
 
@@ -2097,17 +2240,57 @@ class PaginaCopiar(Pagina):
         self.lbl_comando.setText(self._comando_texto(self.argumentos()))
 
     # ─── discos / hilos ───
-    def _info_disco(self, ruta: str, refrescar: bool = False) -> dict | None:
+    @staticmethod
+    def _clave_disco(ruta: str) -> str | None:
         if not ruta:
             return None
-        clave = ntpath.splitdrive(ntpath.abspath(ruta))[0].upper() if ES_WINDOWS else ruta
-        if refrescar or clave not in self._cache_discos:
-            self._cache_discos[clave] = info_unidad(ruta)
-        return self._cache_discos[clave]
+        return ntpath.splitdrive(ntpath.abspath(ruta))[0].upper() if ES_WINDOWS else ruta
 
-    def _detectar_discos(self, refrescar: bool = False):
-        infos = [self._info_disco(self.origen.texto(), refrescar),
-                 self._info_disco(self.destino.texto(), refrescar)]
+    def _detectar_discos(self, refrescar: bool = False, luego=None):
+        """Consulta en otro hilo los discos que falten (o todos con refrescar) y luego los muestra."""
+        rutas = (self.origen.texto(), self.destino.texto())
+        faltan = {}
+        for ruta in rutas:
+            clave = self._clave_disco(ruta)
+            if clave and (refrescar or clave not in self._cache_discos):
+                faltan[clave] = ruta
+        if luego is not None:
+            self._tras_discos = luego
+        if not faltan:
+            self._mostrar_discos()
+            if self._gen_discos == self._gen_mostrada:      # no hay otra consulta en curso
+                self._ejecutar_tras_discos()
+            return
+        self._gen_discos += 1
+        gen = self._gen_discos
+
+        def consultar():
+            resultado = {}
+            for clave, ruta in faltan.items():
+                try:
+                    resultado[clave] = info_unidad(ruta)
+                except Exception:
+                    resultado[clave] = None
+            self.discos_detectados.emit(resultado, gen)
+
+        threading.Thread(target=consultar, daemon=True, name="detectar_discos").start()
+
+    def _discos_listos(self, resultado: dict, gen: int):
+        self._cache_discos.update(resultado)
+        if gen != self._gen_discos:
+            return          # llegará una detección más nueva
+        self._gen_mostrada = gen
+        self._mostrar_discos()
+        self._ejecutar_tras_discos()
+
+    def _ejecutar_tras_discos(self):
+        accion, self._tras_discos = self._tras_discos, None
+        if accion is not None:
+            accion()
+
+    def _mostrar_discos(self):
+        infos = [self._cache_discos.get(self._clave_disco(self.origen.texto())),
+                 self._cache_discos.get(self._clave_disco(self.destino.texto()))]
         hilos, motivo = hilos_segun_discos(infos)
         partes = []
         for nombre, info in (("Origen", infos[0]), ("Destino", infos[1])):
@@ -2211,12 +2394,20 @@ class PaginaCopiar(Pagina):
             self.error("Robocopy solo está disponible en Windows.")
             return
 
-        self._detectar_discos(refrescar=True)   # por si conectaste otro USB con la misma letra
         self._cancelado = False
         self._totales = None
         self._progreso = None
-        self._args_copia = self.argumentos(extra_xd)
+        self._fase = "discos"
         self.set_ocupado(True)
+        self.estado("Revisando los discos…")
+        # Se vuelven a consultar por si conectaste otro USB con la misma letra;
+        # los hilos automáticos se ajustan antes de armar el comando.
+        self._detectar_discos(refrescar=True, luego=lambda: self._iniciar_tras_discos(extra_xd))
+
+    def _iniciar_tras_discos(self, extra_xd: list[str]):
+        if self._fase != "discos":      # se canceló mientras se revisaban los discos
+            return
+        self._args_copia = self.argumentos(extra_xd)
         if self._con_progreso():
             self._fase = "calculo"
             self._salida_calculo = []
@@ -2410,6 +2601,11 @@ class PaginaCopiar(Pagina):
             self._cancelado = True
             self.estado("Cancelando…")
             self.proceso.kill()
+        elif self._fase == "discos":
+            self.consola.agregar("Copia cancelada por el usuario.", "aviso")
+            self.estado("Cancelado.")
+            self.salio_bien = False
+            self._fin()
 
     def esperar(self, ms: int = 3000):
         if self.proceso is not None:
@@ -3048,7 +3244,7 @@ class PaginaEntorno(Pagina):
 
     def _ruta_salida(self) -> Path:
         d = self._datos or {}
-        carpeta = self.carpeta_salida.texto() or d.get("carpeta_venv") or str(carpeta_app())
+        carpeta = self.carpeta_salida.texto() or d.get("carpeta_venv") or str(CARPETA_DATOS)
         nombre = self.nombre_salida.text().strip() or "requirements.txt"
         return Path(carpeta) / nombre
 
@@ -3223,7 +3419,7 @@ def tarea_licencias(t: Tarea, cfg: dict, solo_listar: bool) -> dict:
                    SEPARADOR_DOC, ""]
     contenido = "\n".join(partes).rstrip() + "\n"
 
-    carpeta = cfg["carpeta_salida"] or (str(carpeta_venv) if carpeta_venv else str(carpeta_app()))
+    carpeta = cfg["carpeta_salida"] or (str(carpeta_venv) if carpeta_venv else str(CARPETA_DATOS))
     salida = Path(carpeta) / (cfg["nombre_salida"] or "THIRD_PARTY_NOTICES.txt")
     salida.parent.mkdir(parents=True, exist_ok=True)
     with open(salida, "w", encoding="utf-8", newline="\r\n") as fh:
@@ -3385,6 +3581,138 @@ class PaginaLicencias(Pagina):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 6. ACERCA DE
+# ═════════════════════════════════════════════════════════════════════════════
+
+HERRAMIENTAS = [
+    ("Copiar", "Robocopy con exclusiones, % y tiempo restante, multihilo según el disco."),
+    ("Organizar", "Mueve o copia archivos a una carpeta por extensión, sin sobrescribir."),
+    ("Listar rutas", "Un .txt con las rutas de archivos y carpetas, con filtros."),
+    ("Info entorno", "Versiones de Python y de cada librería de un venv o del global."),
+    ("Licencias", "THIRD_PARTY_NOTICES.txt de un venv, con JSON extra opcional."),
+]
+
+
+class PaginaAcerca(QWidget):
+    def __init__(self, ventana):
+        super().__init__()
+        self.setObjectName("pagina")
+        self.ventana = ventana
+        dpr = ventana.devicePixelRatioF() or 1.0
+
+        raiz = QVBoxLayout(self)
+        raiz.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        contenido = QWidget()
+        contenido.setObjectName("contenidoScroll")
+        scroll.setWidget(contenido)
+        raiz.addWidget(scroll)
+        v = QVBoxLayout(contenido)
+        v.setContentsMargins(SPACING_LG, SPACING_MD, SPACING_LG, SPACING_LG)
+        v.setSpacing(SPACING_MD)
+
+        lbl = QLabel("Acerca de")
+        lbl.setProperty("class", "titulo-pagina")
+        v.addWidget(lbl)
+
+        # ─── Presentación + creador ───
+        fila = QHBoxLayout()
+        fila.setSpacing(SPACING_MD)
+        heroe, lay = tarjeta()
+        lay.setContentsMargins(SPACING_LG, SPACING_LG, SPACING_LG, SPACING_LG)
+        cabeza = QHBoxLayout()
+        cabeza.setSpacing(SPACING_LG)
+        logo = QLabel()
+        logo.setPixmap(pixmap_escalado("logo_app.png", 96, dpr))
+        cabeza.addWidget(logo, 0, Qt.AlignmentFlag.AlignTop)
+        textos = QVBoxLayout()
+        textos.setSpacing(SPACING_SM)
+        nombre = QLabel(APP_NOMBRE)
+        nombre.setProperty("class", "titulo-pagina")
+        textos.addWidget(nombre)
+        version = QLabel(f"Versión {APP_VERSION}")
+        version.setProperty("class", "version")
+        textos.addWidget(version, 0, Qt.AlignmentFlag.AlignLeft)
+        textos.addWidget(etiqueta("Varias utilidades de archivos en una sola ventana: copiar, organizar, "
+                                  "listar rutas y revisar entornos de Python y sus licencias.", "suave"))
+        textos.addStretch(1)
+        cabeza.addLayout(textos, 1)
+        lay.addLayout(cabeza)
+        fila.addWidget(heroe, 3)
+
+        autor, lay = tarjeta()
+        lay.setContentsMargins(SPACING_LG, SPACING_LG, SPACING_LG, SPACING_LG)
+        avatar = QLabel()
+        avatar.setPixmap(pixmap_circular("avatar_DoMiN.jpg", 88, dpr))
+        avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(avatar)
+        for texto, clase in (("CREADO POR", "etiqueta"), (APP_AUTOR, "autor"),
+                             (f"{APP_AUTOR_NOMBRE} · © {APP_ANIO}", "suave")):
+            w = etiqueta(texto, clase)
+            w.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(w)
+        fila.addWidget(autor, 2)
+        v.addLayout(fila)
+
+        # ─── Herramientas ───
+        card, lay = tarjeta("Herramientas")
+        g = grid_opciones()
+        for i, (nombre_h, desc) in enumerate(HERRAMIENTAS):
+            n = QLabel(nombre_h)
+            n.setProperty("class", "dato")
+            g.addWidget(n, i, 0)
+            g.addWidget(etiqueta(desc, "suave"), i, 1)
+        lay.addLayout(g)
+        v.addWidget(card)
+
+        # ─── Información técnica ───
+        card, lay = tarjeta("Información")
+        g = grid_opciones()
+        datos = [
+            ("VERSIÓN", APP_VERSION),
+            ("EJECUCIÓN", forma_de_ejecucion()),
+            ("PYTHON", sys.version.split()[0]),
+            ("INTERFAZ", f"PyQt6 {PYQT_VERSION_STR} (GPL v3) · Qt {QT_VERSION_STR} (LGPL v3)"),
+            ("CONFIGURACIÓN", str(CONFIG_PATH)),
+        ]
+        for i, (nombre_d, valor) in enumerate(datos):
+            g.addWidget(etiqueta(nombre_d), i, 0)
+            lbl = QLabel(valor)
+            lbl.setWordWrap(True)
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            g.addWidget(lbl, i, 1)
+        lay.addLayout(g)
+        botones = QHBoxLayout()
+        botones.setSpacing(SPACING_SM)
+        b = boton("Abrir carpeta de datos", tooltip="Configuración, sesiones y registros de robocopy")
+        b.clicked.connect(lambda: abrir_en_sistema(CARPETA_DATOS))
+        botones.addWidget(b)
+        b = boton("Código fuente", "fantasma", APP_REPO)
+        b.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(APP_REPO)))
+        botones.addWidget(b)
+        botones.addStretch(1)
+        lay.addLayout(botones)
+        v.addWidget(card)
+
+        v.addStretch(1)
+        pie = etiqueta(f"© {APP_ANIO} {APP_AUTOR_NOMBRE} ({APP_AUTOR})", "suave")
+        pie.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(pie)
+
+    # Misma interfaz que las demás páginas (la ventana las recorre al cerrar)
+    def ocupada(self) -> bool:
+        return False
+
+    def cancelar(self):
+        pass
+
+    def esperar(self, ms: int = 0):
+        pass
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # VENTANA PRINCIPAL
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -3392,7 +3720,7 @@ class VentanaPrincipal(QMainWindow):
     def __init__(self, app: QApplication, config: Config):
         super().__init__()
         self.app, self.config = app, config
-        self.setWindowTitle(APP_NOMBRE)
+        self.setWindowTitle(f"{APP_NOMBRE} {APP_VERSION}")
         self.setMinimumSize(900, 560)
         self._ajustar_a_pantalla()
 
@@ -3412,6 +3740,10 @@ class VentanaPrincipal(QMainWindow):
         h = QHBoxLayout(barra)
         h.setContentsMargins(SPACING_LG, SPACING_MD, SPACING_LG, SPACING_MD)
         h.setSpacing(SPACING_MD)
+        dpr = self.devicePixelRatioF() or 1.0
+        logo = QLabel()
+        logo.setPixmap(pixmap_escalado("logo_app.png", 32, dpr))
+        h.addWidget(logo)
         titulo = QLabel(APP_NOMBRE)
         titulo.setProperty("class", "titulo-app")
         h.addWidget(titulo)
@@ -3419,6 +3751,15 @@ class VentanaPrincipal(QMainWindow):
         sub.setWordWrap(False)
         sub.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         h.addWidget(sub, 1)
+        # Creador: avatar + nombre; abre «Acerca de»
+        self.btn_creador = boton(f"  {APP_AUTOR}", "creador",
+                                 f"Creado por {APP_AUTOR_NOMBRE} ({APP_AUTOR}) · Acerca de")
+        avatar = pixmap_circular("avatar_DoMiN.jpg", 24, dpr)
+        if not avatar.isNull():
+            self.btn_creador.setIcon(QIcon(avatar))
+            self.btn_creador.setIconSize(QSize(24, 24))
+        self.btn_creador.clicked.connect(lambda: self.tabs.setCurrentWidget(self.pagina_acerca))
+        h.addWidget(self.btn_creador)
         self.btn_tema = boton("", "fantasma", "Cambiar entre tema claro y oscuro")
         self.btn_tema.clicked.connect(self.alternar_tema)
         h.addWidget(self.btn_tema)
@@ -3426,6 +3767,7 @@ class VentanaPrincipal(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
+        self.tabs.tabBar().setDrawBase(False)   # Fusion dibuja una línea clara que no sigue el tema
         self.paginas = [
             ("Copiar", PaginaCopiar(self)),
             ("Organizar", PaginaOrganizar(self)),
@@ -3433,6 +3775,8 @@ class VentanaPrincipal(QMainWindow):
             ("Info entorno", PaginaEntorno(self)),
             ("Licencias", PaginaLicencias(self)),
         ]
+        self.pagina_acerca = PaginaAcerca(self)
+        self.paginas.append(("Acerca de", self.pagina_acerca))
         for nombre, pagina in self.paginas:
             self.tabs.addTab(pagina, nombre)
         v.addWidget(self.tabs, 1)
@@ -3495,17 +3839,335 @@ class VentanaPrincipal(QMainWindow):
         e.accept()
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# AUTOPRUEBA (para revisar los .exe compilados sin mostrar la ventana)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def autoprueba(app: QApplication, ventana: VentanaPrincipal) -> int:
+    """
+    `UtilidadesArchivos.exe --autoprueba`: con la ventana oculta y una configuración
+    temporal, prueba recursos, complementos de Qt y cada pestaña con archivos de prueba
+    (incluido el JSON extra de Licencias). Mide cuánto se llega a trabar la interfaz.
+    Deja autoprueba.json en UTILIDADES_DATOS o junto al .exe. Código de salida 0 = todo bien.
+    """
+    import faulthandler
+    from PyQt6.QtGui import QImageReader
+
+    if _REGISTRO_FALLOS["archivo"] is not None:
+        # Si algo se queda colgado, deja la pila en fallo_grave.log y termina
+        faulthandler.dump_traceback_later(240, exit=True, file=_REGISTRO_FALLOS["archivo"])
+    ventana.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+    ventana.show()
+    pag = dict(ventana.paginas)
+    pruebas: dict[str, dict] = {}
+    # Latido cada 10 ms mientras la app trabaja: si tarda mucho más en llegar, la
+    # interfaz estuvo trabada ese tiempo
+    bloqueos: list[int] = []
+    reloj = QElapsedTimer()
+    latido = QTimer()
+    latido.setInterval(10)
+    latido.timeout.connect(lambda: bloqueos.append(reloj.restart()))
+
+    def esperar(pagina, segundos: float) -> bool:
+        limite = time.monotonic() + segundos
+        reloj.start()
+        latido.start()
+        while pagina.ocupada() and time.monotonic() < limite:
+            app.processEvents()
+            time.sleep(0.005)
+        latido.stop()
+        for _ in range(20):           # que la consola termine de escribir
+            app.processEvents()
+            time.sleep(0.005)
+        return not pagina.ocupada()
+
+    def registrar(nombre: str, ok: bool, **detalle):
+        pruebas[nombre] = {"ok": bool(ok), **detalle}
+
+    # Bitácora paso a paso: si el proceso muere de golpe, dice en qué prueba iba
+    bitacora = CARPETA_DATOS / "autoprueba_pasos.txt"
+
+    def paso(texto: str):
+        try:
+            with open(bitacora, "a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%H:%M:%S')} {texto}\n")
+        except OSError:
+            pass
+
+    def probar(nombre: str, funcion):
+        paso(f"inicio {nombre}")
+        try:
+            funcion()
+        except Exception as e:
+            registrar(nombre, False, error=f"{type(e).__name__}: {e}")
+        paso(f"fin {nombre}: {pruebas.get(nombre)}")
+
+    try:
+        bitacora.unlink()
+    except OSError:
+        pass
+    paso("inicio de la autoprueba")
+    formatos = {bytes(f).decode().lower() for f in QImageReader.supportedImageFormats()}
+    registrar("recursos", not imagen("logo_app.png").isNull() and not imagen("avatar_DoMiN.jpg").isNull(),
+              carpeta=str(carpeta_recursos()))
+    registrar("formatos_imagen", {"png", "jpg", "svg"} <= formatos,
+              encontrados=sorted(formatos & {"png", "jpg", "jpeg", "svg", "ico"}))
+    ventana.config.guardar()
+    registrar("configuracion", CONFIG_PATH.exists() and ventana.config.error is None, ruta=str(CONFIG_PATH))
+
+    tmp = Path(tempfile.mkdtemp(prefix="utilidades_autoprueba_"))
+    try:
+        origen = tmp / "origen con espacios (ñ)"
+        for i in range(300):
+            carpeta = origen / f"sub{i % 10}"
+            carpeta.mkdir(parents=True, exist_ok=True)
+            (carpeta / f"archivo{i}.txt").write_bytes(b"x" * 1024)
+        (origen / "__pycache__").mkdir()
+        (origen / "__pycache__" / "cache.pyc").write_bytes(b"c")
+        (origen / "documento.pdf").write_bytes(b"%PDF")
+        (origen / "foto.JPG").write_bytes(b"jpg")
+
+        # 1. Copiar (robocopy)
+        def copiar():
+            p = pag["Copiar"]
+            destino = tmp / "destino"
+            p.origen.establecer(str(origen))
+            p.destino.establecer(str(destino))
+            p.chk_simular.setChecked(False)
+            p.iniciar()
+            terminado = esperar(p, 120)
+            copia = destino / origen.name
+            n = sum(1 for _ in copia.rglob("*.txt")) if copia.exists() else 0
+            registrar("copiar", terminado and p.salio_bien and n == 300 and not (copia / "__pycache__").exists(),
+                      archivos_copiados=n, estado=p.lbl_estado.text())
+        if ES_WINDOWS:
+            probar("copiar", copiar)
+
+        # 2. Listar rutas
+        def rutas():
+            p = pag["Listar rutas"]
+            p.carpeta.establecer(str(origen))
+            p.carpeta_salida.establecer(str(tmp))
+            p.rb_solo.setChecked(True)
+            p.lista_ext.establecer([[".pdf", True], [".jpg", True]])
+            p.generar()
+            esperar(p, 60)
+            lineas = Path(p._ultima_salida).read_text(encoding="utf-8").splitlines() if p._ultima_salida else []
+            archivos = [x for x in lineas if Path(x).suffix]
+            registrar("listar_rutas", len(archivos) == 2, rutas=len(lineas))
+        probar("listar_rutas", rutas)
+
+        # 3. Organizar (escanear y copiar los .pdf, sin la pregunta de confirmación)
+        def organizar():
+            p = pag["Organizar"]
+            p.origen.establecer(str(origen))
+            p.escanear()
+            esperar(p, 60)
+            destino = tmp / "Organizado"
+            p.lanzar(tarea_organizar, (p._por_ext, [".pdf"], str(destino), False, True), p._organizado)
+            esperar(p, 60)
+            registrar("organizar", (destino / "pdf" / "documento.pdf").exists() and (origen / "documento.pdf").exists(),
+                      extensiones=sorted(p._por_ext or {}))
+        probar("organizar", organizar)
+
+        # 4 y 5. Info entorno y Licencias con el Python global (si hay uno)
+        try:
+            python_global = buscar_python_global()
+        except Exception:
+            python_global = None
+        if python_global is None:
+            registrar("info_entorno", True, omitida="no hay un Python global en el PATH")
+            registrar("licencias", True, omitida="no hay un Python global en el PATH")
+        else:
+            def info():
+                p = pag["Info entorno"]
+                p.selector.rb_global.setChecked(True)
+                p.carpeta_salida.establecer(str(tmp))
+                p.analizar()
+                esperar(p, 180)
+                registrar("info_entorno", bool(p._datos and p._datos["paquetes"]) and (tmp / "requirements.txt").exists(),
+                          python=str(python_global), paquetes=len((p._datos or {}).get("paquetes", [])))
+            probar("info_entorno", info)
+
+            def licencias():
+                (tmp / "LICENCIA_COMPONENTE.txt").write_text("Texto de la licencia de prueba", encoding="utf-8")
+                extra = tmp / "licencias_extra.json"
+                extra.write_text(json.dumps({
+                    "encabezado": "Encabezado propio de la autoprueba",
+                    "componentes": [{"nombre": "ComponentePrueba", "version": "1.0", "tipo": "MIT",
+                                     "url": "https://example.com", "archivo": "LICENCIA_COMPONENTE.txt"}],
+                }, ensure_ascii=False), encoding="utf-8")
+                p = pag["Licencias"]
+                p.selector.rb_global.setChecked(True)
+                p.carpeta_salida.establecer(str(tmp))
+                p.extra.establecer(str(extra))
+                p.generar(False)
+                esperar(p, 300)
+                doc = tmp / "THIRD_PARTY_NOTICES.txt"
+                texto = doc.read_text(encoding="utf-8") if doc.exists() else ""
+                registrar("licencias", "Encabezado propio de la autoprueba" in texto
+                          and "--- ComponentePrueba (1.0) ---" in texto and "Texto de la licencia de prueba" in texto,
+                          kb=len(texto) // 1024)
+            probar("licencias", licencias)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    maximo = max(bloqueos, default=0)
+    registrar("interfaz_sin_congelarse", maximo < 500, max_bloqueo_ms=maximo)
+    ok = all(p["ok"] for p in pruebas.values())
+    informe = {
+        "resultado": "OK" if ok else "FALLO",
+        "version": APP_VERSION,
+        "ejecucion": forma_de_ejecucion(),
+        "python": sys.version.split()[0],
+        "qt": QT_VERSION_STR,
+        "rutas": {"app": str(carpeta_app()), "recursos": str(carpeta_recursos()), "datos": str(CARPETA_DATOS)},
+        "pruebas": pruebas,
+    }
+    ventana.close()
+    app.processEvents()
+    texto = json.dumps(informe, ensure_ascii=False, indent=2)
+    for carpeta in (Path(os.environ.get("UTILIDADES_DATOS") or carpeta_app()), CARPETA_DATOS):
+        try:
+            (carpeta / "autoprueba.json").write_text(texto, encoding="utf-8")
+            break
+        except OSError:
+            continue
+    return 0 if ok else 1
+
+
+# Archivo de fallo_grave.log y el manejador de mensajes de Qt: deben seguir vivos toda la sesión
+_REGISTRO_FALLOS: dict = {"archivo": None, "manejador": None}
+
+
+def escribir_fallo(texto: str):
+    archivo = _REGISTRO_FALLOS["archivo"]
+    if archivo is None:
+        return
+    try:
+        archivo.write(texto.rstrip("\n") + "\n")
+        archivo.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def activar_registro_de_fallos():
+    """
+    fallo_grave.log (en la carpeta de datos) guarda la pila de Python si la app se cierra de
+    golpe, los mensajes graves de Qt y los errores de Python no controlados: compilada sin
+    consola no habría otra pista. Se sobrescribe en cada arranque.
+    """
+    import faulthandler
+    from PyQt6.QtCore import QtMsgType, qInstallMessageHandler
+    try:
+        CARPETA_DATOS.mkdir(parents=True, exist_ok=True)
+        archivo = open(CARPETA_DATOS / "fallo_grave.log", "w", encoding="utf-8")
+        archivo.write(f"{APP_NOMBRE} {APP_VERSION} ({forma_de_ejecucion()}) · {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                      "Si la app falló o se cerró sola, aquí abajo queda el motivo:\n")
+        archivo.flush()
+        faulthandler.enable(archivo, all_threads=True)
+    except OSError:
+        return
+    _REGISTRO_FALLOS["archivo"] = archivo
+
+    graves = (QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg)
+
+    def mensaje_qt(tipo, contexto, texto):
+        if tipo in graves:
+            escribir_fallo(f"[Qt {tipo.name}] {texto}")
+        if sys.stderr is not None:          # sin consola (compilada) es None
+            try:
+                print(texto, file=sys.stderr)
+            except (OSError, ValueError):
+                pass
+
+    _REGISTRO_FALLOS["manejador"] = mensaje_qt
+    qInstallMessageHandler(mensaje_qt)
+
+
+def instalar_manejador_de_errores(ventana=None, mostrar: bool = True):
+    """
+    PyQt6 cierra la app de golpe si un botón o señal lanza una excepción no controlada.
+    Así se registra en fallo_grave.log, se avisa con un mensaje y la app sigue abierta.
+    """
+    import traceback
+
+    def al_error(tipo, valor, rastro):
+        texto = "".join(traceback.format_exception(tipo, valor, rastro))
+        escribir_fallo(f"[Error de Python] {time.strftime('%H:%M:%S')}\n{texto}")
+        if sys.stderr is not None:
+            try:
+                sys.stderr.write(texto)
+            except (OSError, ValueError):
+                pass
+        if mostrar:
+            try:
+                QMessageBox.critical(ventana, APP_NOMBRE,
+                                     f"Ocurrió un error inesperado:\n\n{valor}\n\n"
+                                     f"Los detalles quedaron en:\n{CARPETA_DATOS / 'fallo_grave.log'}")
+            except Exception:
+                pass
+
+    sys.excepthook = al_error
+
+
+def ruta_corta(ruta: str) -> str:
+    """Ruta 8.3 de Windows (C:\\Users\\DOMINA~1\\...); si no se puede, la original."""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(ruta), buf, 1024):
+            return buf.value
+    except Exception:
+        pass
+    return str(ruta)
+
+
+def acortar_rutas_de_plugins():
+    """
+    Windows no carga DLLs con rutas de más de 260 caracteres. Si la app está en una carpeta
+    muy profunda, ...\\plugins\\platforms\\qwindows.dll se pasa del límite y Qt se cierra con
+    "no Qt platform plugin could be initialized". Se le da a Qt la ruta corta (8.3) de sus
+    plugins, que apunta a la misma carpeta. Va antes de crear QApplication.
+    """
+    if not ES_WINDOWS:
+        return
+    from PyQt6.QtCore import QCoreApplication, QLibraryInfo
+    plugins = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
+    if len(plugins) + len("\\imageformats\\qwebp.dll") < 250:
+        return
+    corta = ruta_corta(plugins)
+    if corta != plugins and os.path.isdir(corta):
+        QCoreApplication.setLibraryPaths([corta] + QCoreApplication.libraryPaths())
+
+
 def main():
+    activar_registro_de_fallos()
+    acortar_rutas_de_plugins()
     if ES_WINDOWS:
         try:  # icono propio en la barra de tareas en vez del de python
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("utilidades.archivos")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
         except Exception:
+            pass
+    if "--autoprueba" in sys.argv and not os.environ.get("UTILIDADES_DATOS"):
+        try:        # empezar con la configuración predeterminada
+            CONFIG_PATH.unlink()
+        except OSError:
             pass
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NOMBRE)
+    app.setApplicationVersion(APP_VERSION)
+    app.setOrganizationName(APP_AUTOR)
     app.setStyle("Fusion")
+    icono = recurso("app.ico") if recurso("app.ico").exists() else recurso("logo_app.png")
+    app.setWindowIcon(QIcon(str(icono)))
     ventana = VentanaPrincipal(app, Config(CONFIG_PATH))
+    autoprueba_activa = "--autoprueba" in sys.argv
+    # En la autoprueba no se muestran mensajes (esperarían un clic): solo se registran
+    instalar_manejador_de_errores(ventana, mostrar=not autoprueba_activa)
+    if autoprueba_activa:
+        sys.exit(autoprueba(app, ventana))
     ventana.show()
     sys.exit(app.exec())
 
