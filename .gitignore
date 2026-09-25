@@ -8,3 +8,7 @@ dist/
 *.spec
 .idea/
 .vscode/
+
+# Temporales de la app
+*.json.tmp
+*.json.bak
