@@ -1,10 +1,10 @@
 @echo off
 setlocal
-:: Menu para compilar con el venv del proyecto (lo crea crear_venv.bat).
+:: Menu para compilar con el venv del proyecto (lo crea build_env.bat).
 :: Para opciones extra (--consola, --sin-prueba) usa compilar.py directamente.
 cd /d "%~dp0"
-if exist ".venv\Scripts\python.exe" goto menu
-echo No existe el entorno virtual. Ejecuta primero crear_venv.bat
+if exist "build_env\Scripts\python.exe" goto menu
+echo No existe el entorno virtual. Ejecuta primero build_env.bat
 pause
 exit /b 1
 
@@ -28,7 +28,7 @@ if "%OPCION%"=="4" set "ARGS=nuitka --onefile"
 if "%OPCION%"=="5" set "ARGS=todo"
 
 echo.
-".venv\Scripts\python.exe" compilar.py %ARGS%
+"build_env\Scripts\python.exe" compilar.py %ARGS%
 echo.
 if errorlevel 1 echo Algo fallo: revisa los mensajes de arriba.
 if not errorlevel 1 echo Todo listo. El ejecutable quedo en la carpeta dist.

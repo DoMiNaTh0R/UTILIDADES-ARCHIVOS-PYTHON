@@ -1,21 +1,17 @@
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-env/
-build/
-dist/
-*.spec
-.idea/
-.vscode/
+# Al repositorio solo van estos archivos. Todo lo demás (Instalador, legacy, build_env,
+# build, dist, configuración, registros, certificados...) se queda solo en tu PC.
+/*
+!/.gitignore
+!/.gitattributes
+!/utilidades_archivos.py
+!/compilar.py
+!/compilar.bat
+!/build_env.bat
+!/requirements.txt
+!/README.md
+!/LICENSE
+!/recursos/
 
-# Temporales de la app
-*.json.tmp
-*.json.bak
-utilidades_archivos/registros/
-
-# Datos locales de la app (se crean solos junto al script o al .exe)
-utilidades_archivos/utilidades_config.json
-fallo_grave.log
-autoprueba.json
-autoprueba_pasos.txt
+# Por si alguna vez se agrega algo a mano: nunca certificados de firma
+*.pfx
+*.p12

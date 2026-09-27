@@ -1,7 +1,0 @@
--r requirements.txt
-# Compilar (compilar.py usa el que elijas)
-pyinstaller>=6.10
-pyinstaller-hooks-contrib
-nuitka>=2.7
-# Solo para regenerar recursos\app.ico cuando cambias logo_app.png
-Pillow

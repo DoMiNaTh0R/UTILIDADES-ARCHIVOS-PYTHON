@@ -1,7 +1,9 @@
+# Utilidades de archivos · Copyright (C) 2026  Kevin González (DoMiNaTh0R)
+# SPDX-License-Identifier: GPL-3.0-or-later  (ver LICENSE)
 """
 Compila Utilidades de archivos con PyInstaller o con Nuitka.
 
-Uso (con el venv del proyecto; lo crea crear_venv.bat):
+Uso (con el venv del proyecto, build_env; lo crea build_env.bat):
     python compilar.py pyinstaller              carpeta (recomendado: arranca más rápido)
     python compilar.py pyinstaller --onefile    un solo .exe
     python compilar.py nuitka                   carpeta, compilado a código C nativo
@@ -20,12 +22,16 @@ La configuración (utilidades_config.json) se crea junto al .exe la primera vez 
 Nuitka necesita un compilador de C: usa Visual Studio Build Tools si está instalado; si no,
 descarga uno automáticamente (una sola vez).
 
+Junto al .exe (y dentro de él) van LICENSE (GNU GPL v3) y THIRD_PARTY_NOTICES.txt, que se
+genera aquí con la licencia completa de lo que se empaqueta: PyQt6, Qt, sip y Python.
+
 Al terminar ejecuta el .exe con --autoprueba (sin mostrar la ventana): prueba recursos,
 complementos de Qt y cada pestaña (incluido el JSON extra de Licencias) y muestra el resultado.
 """
 import ast
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -34,11 +40,14 @@ import tempfile
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent
-FUENTE = RAIZ / "utilidades_archivos" / "utilidades_archivos.py"
-RECURSOS = FUENTE.parent / "recursos"
+FUENTE = RAIZ / "utilidades_archivos.py"
+RECURSOS = RAIZ / "recursos"
 ICONO = RECURSOS / "app.ico"
 LOGO = RECURSOS / "logo_app.png"
+LICENCIA = RAIZ / "LICENSE"
+LICENCIA_IMAGENES = RECURSOS / "LICENCIA_LOGO_Y_AVATAR.txt"     # el logo y el avatar no están bajo la GPL
 TRABAJO = RAIZ / "build"
+AVISOS = TRABAJO / "THIRD_PARTY_NOTICES.txt"
 DIST = RAIZ / "dist"
 
 ONEFILE = "--onefile" in sys.argv
@@ -48,22 +57,27 @@ CONSOLA = "--consola" in sys.argv
 EXCLUIR = ["tkinter", "numpy", "PIL", "PyQt5", "PySide2", "PySide6"]
 # Archivos grandes de Qt que no hacen falta (la interfaz no usa OpenGL)
 SOBRANTES = ["opengl32sw.dll"]
+# Paquetes de Python que van dentro del .exe (lo demás es la biblioteca estándar de Python)
+PAQUETES_INCLUIDOS = ["PyQt6", "PyQt6-Qt6", "PyQt6-sip"]
 
 
 def datos_app() -> dict:
-    """APP_NOMBRE, APP_VERSION... leídos del código fuente sin importarlo (no hace falta PyQt6)."""
+    """APP_NOMBRE, APP_VERSION... (y el lector de licencias) leídos del código fuente sin importarlo."""
     datos = {}
     for nodo in ast.parse(FUENTE.read_text(encoding="utf-8")).body:
         if isinstance(nodo, ast.Assign) and isinstance(nodo.value, ast.Constant):
             for destino in nodo.targets:
-                if isinstance(destino, ast.Name) and destino.id.startswith("APP_"):
+                if isinstance(destino, ast.Name) and (destino.id.startswith("APP_")
+                                                      or destino.id == "HELPER_ENTORNO"):
                     datos[destino.id] = nodo.value.value
     return datos
 
 
 APP = datos_app()
 NOMBRE_EXE = APP["APP_ID"]
-COPYRIGHT = f"© {APP['APP_ANIO']} {APP['APP_AUTOR_NOMBRE']} ({APP['APP_AUTOR']})"
+# En las propiedades del .exe va solo el nombre real; dentro de la app se ve también DoMiNaTh0R
+AUTOR_EXE = APP["APP_AUTOR_NOMBRE"]
+COPYRIGHT = f"© {APP['APP_ANIO']} {AUTOR_EXE}. Licencia {APP['APP_LICENCIA']}."
 
 
 def version_windows() -> tuple[str, ...]:
@@ -88,13 +102,18 @@ def borrar(ruta: Path):
 
 def preparar_icono():
     """Regenera recursos\\app.ico si cambiaste logo_app.png (hace falta Pillow)."""
+    if not LOGO.exists():
+        # El logo y el avatar no van en el repositorio: sin ellos se compila igual, sin icono propio
+        if not ICONO.exists():
+            print("Aviso: no está recursos\\logo_app.png: el .exe se compila sin icono propio ni imágenes.")
+        return
     if ICONO.exists() and ICONO.stat().st_mtime >= LOGO.stat().st_mtime:
         return
     try:
         from PIL import Image
     except ImportError:
         if not ICONO.exists():
-            sys.exit("Falta recursos\\app.ico y Pillow para crearlo:  pip install -r requirements-dev.txt")
+            sys.exit("Falta recursos\\app.ico y Pillow para crearlo:  ejecuta build_env.bat")
         print("Aviso: logo_app.png es más nuevo que app.ico, pero sin Pillow no se puede regenerar.")
         return
     imagen = Image.open(LOGO).convert("RGBA")
@@ -109,6 +128,56 @@ def tamano_mb(ruta: Path) -> float:
     if ruta.is_file():
         return ruta.stat().st_size / 1e6
     return sum(f.stat().st_size for f in ruta.rglob("*") if f.is_file()) / 1e6
+
+
+def escribir_avisos_de_terceros() -> Path:
+    """
+    THIRD_PARTY_NOTICES.txt con la licencia completa de lo que va dentro del .exe. Usa el mismo
+    lector de licencias que la pestaña «Licencias» de la app, ejecutado con el Python del venv.
+    """
+    TRABAJO.mkdir(parents=True, exist_ok=True)
+    lector, datos = TRABAJO / "leer_licencias.py", TRABAJO / "licencias_venv.json"
+    lector.write_text(APP["HELPER_ENTORNO"], encoding="utf-8")
+    r = subprocess.run([sys.executable, str(lector), "licencias", str(datos)], capture_output=True, text=True)
+    if r.returncode != 0 or not datos.exists():
+        sys.exit(f"No se pudieron leer las licencias del venv:\n{r.stderr}")
+    def normalizar(nombre: str) -> str:          # PEP 503: PyQt6_sip == pyqt6-sip
+        return re.sub(r"[-_.]+", "-", nombre).lower()
+
+    instalados = {normalizar(p["nombre"]): p for p in json.loads(datos.read_text(encoding="utf-8"))["paquetes"]}
+    componentes = []
+    for nombre in PAQUETES_INCLUIDOS:
+        p = instalados.get(normalizar(nombre))
+        if p is None:
+            sys.exit(f"Falta {nombre} en el venv:  pip install -r requirements.txt")
+        componentes.append((p["nombre"], p["version"], p["tipo"], p["texto"]))
+    licencia_python = Path(sys.base_prefix) / "LICENSE.txt"
+    texto_python = (licencia_python.read_text(encoding="utf-8", errors="replace") if licencia_python.exists()
+                    else "Consulta https://docs.python.org/3/license.html")
+    componentes.append(("Python", sys.version.split()[0], "PSF-2.0", texto_python))
+
+    linea = "=" * 72
+    partes = [linea, "AVISOS DE TERCEROS / THIRD-PARTY NOTICES".center(72), linea, "",
+              f"{APP['APP_NOMBRE']} {APP['APP_VERSION']} · {COPYRIGHT}",
+              f"Código fuente: {APP['APP_REPO']}", "",
+              "Este programa incluye los componentes de terceros de abajo, cada uno con su licencia.",
+              "Qt se distribuye bajo la LGPL v3: sus bibliotecas van como archivos DLL separados (Qt6*.dll)",
+              "que se pueden reemplazar por otra versión compatible; su código fuente está en https://download.qt.io/.",
+              "Robocopy, PowerShell y winget son programas de Windows que la app solo ejecuta: no van incluidos.",
+              "", "Resumen:"]
+    partes += [f"  {nombre} {version}  ·  {tipo}" for nombre, version, tipo, _ in componentes]
+    for nombre, version, tipo, texto in componentes:
+        partes += ["", "-" * 72, f"{nombre} {version}  ·  {tipo}", "-" * 72, "", texto.strip()]
+    AVISOS.write_text("\n".join(partes) + "\n", encoding="utf-8")
+    print("Avisos de terceros: " + ", ".join(f"{nombre} ({tipo})" for nombre, _, tipo, _ in componentes))
+    return AVISOS
+
+
+def copiar_documentos_legales(carpeta: Path):
+    """LICENSE, THIRD_PARTY_NOTICES.txt y el aviso del logo y avatar junto al .exe, a la vista de quien lo reciba."""
+    for archivo in (LICENCIA, AVISOS, LICENCIA_IMAGENES):
+        if archivo.exists():
+            shutil.copy2(archivo, carpeta / archivo.name)
 
 
 def quitar_sobrantes(carpeta: Path):
@@ -131,7 +200,7 @@ VSVersionInfo(
   kids=[
     StringFileInfo([
       StringTable('040a04B0', [
-        StringStruct('CompanyName', '{APP['APP_AUTOR_NOMBRE']} ({APP['APP_AUTOR']})'),
+        StringStruct('CompanyName', '{AUTOR_EXE}'),
         StringStruct('FileDescription', '{APP['APP_NOMBRE']}'),
         StringStruct('FileVersion', '{APP['APP_VERSION']}'),
         StringStruct('InternalName', '{NOMBRE_EXE}'),
@@ -151,7 +220,7 @@ def compilar_pyinstaller() -> Path:
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
-        sys.exit("PyInstaller no está instalado:  pip install -r requirements-dev.txt")
+        sys.exit("PyInstaller no está instalado:  ejecuta build_env.bat")
     destino = DIST / "pyinstaller"
     exe = destino / f"{NOMBRE_EXE}.exe" if ONEFILE else destino / NOMBRE_EXE / f"{NOMBRE_EXE}.exe"
     borrar(exe if ONEFILE else exe.parent)
@@ -159,11 +228,15 @@ def compilar_pyinstaller() -> Path:
            "--name", NOMBRE_EXE, "--noconfirm", "--clean",
            "--distpath", str(destino),
            "--workpath", str(TRABAJO / "pyinstaller"), "--specpath", str(TRABAJO / "pyinstaller"),
-           "--icon", str(ICONO),
            "--version-file", str(escribir_version_info()),
-           "--add-data", f"{RECURSOS}{os.pathsep}recursos",
+           "--add-data", f"{LICENCIA}{os.pathsep}.",
+           "--add-data", f"{AVISOS}{os.pathsep}.",
            "--onefile" if ONEFILE else "--onedir",
            "--console" if CONSOLA else "--windowed"]
+    if ICONO.exists():
+        cmd += ["--icon", str(ICONO)]
+    if RECURSOS.is_dir():
+        cmd += ["--add-data", f"{RECURSOS}{os.pathsep}recursos"]
     for modulo in EXCLUIR:
         cmd += ["--exclude-module", modulo]
     print(f"\n=== PyInstaller ({'un solo .exe' if ONEFILE else 'carpeta'}) ===")
@@ -171,17 +244,28 @@ def compilar_pyinstaller() -> Path:
         sys.exit("PyInstaller falló.")
     if not ONEFILE:
         quitar_sobrantes(exe.parent)
+    copiar_documentos_legales(exe.parent)
     print(f"Listo: {exe}  ({tamano_mb(exe if ONEFILE else exe.parent):.0f} MB)")
     return exe
 
 
 # ─── Nuitka ─────────────────────────────────────────────────────────────────
 
+def traduccion_qt() -> Path | None:
+    """qtbase_es.qm: los menús propios de Qt (Copiar, Pegar…) en español."""
+    import importlib.util
+    spec = importlib.util.find_spec("PyQt6")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    ruta = Path(list(spec.submodule_search_locations)[0]) / "Qt6" / "translations" / "qtbase_es.qm"
+    return ruta if ruta.is_file() else None
+
+
 def compilar_nuitka() -> Path:
     try:
         import nuitka  # noqa: F401
     except ImportError:
-        sys.exit("Nuitka no está instalado:  pip install -r requirements-dev.txt")
+        sys.exit("Nuitka no está instalado:  ejecuta build_env.bat")
     salida = TRABAJO / "nuitka"
     destino = DIST / "nuitka"
     version = ".".join(version_windows())
@@ -189,19 +273,26 @@ def compilar_nuitka() -> Path:
            "--onefile" if ONEFILE else "--standalone",
            "--enable-plugin=pyqt6",
            f"--windows-console-mode={'force' if CONSOLA else 'disable'}",
-           f"--windows-icon-from-ico={ICONO}",
-           f"--include-data-dir={RECURSOS}=recursos",
+           f"--include-data-files={LICENCIA}=LICENSE",
+           f"--include-data-files={AVISOS}=THIRD_PARTY_NOTICES.txt",
            f"--output-dir={salida}",
            f"--output-filename={NOMBRE_EXE}.exe",
-           f"--company-name={APP['APP_AUTOR_NOMBRE']} ({APP['APP_AUTOR']})",
+           f"--company-name={AUTOR_EXE}",
            f"--product-name={APP['APP_NOMBRE']}",
            f"--file-description={APP['APP_NOMBRE']}",
            f"--copyright={COPYRIGHT}",
            f"--file-version={version}", f"--product-version={version}",
            "--assume-yes-for-downloads", "--remove-output"]
+    if ICONO.exists():
+        cmd.append(f"--windows-icon-from-ico={ICONO}")
+    if RECURSOS.is_dir():
+        cmd.append(f"--include-data-dir={RECURSOS}=recursos")
+    traduccion = traduccion_qt()
+    if traduccion is not None:      # Nuitka no incluye las traducciones de Qt (PyInstaller sí)
+        cmd.append(f"--include-data-files={traduccion}=traducciones/{traduccion.name}")
     if ONEFILE:
         # Carpeta fija de extracción: a partir del segundo arranque abre al instante
-        # (subcarpeta propia: %LOCALAPPDATA%\UtilidadesArchivos también puede guardar la configuración)
+        # (%LOCALAPPDATA%\UtilidadesArchivos\onefile_<versión>, junto a la configuración y los registros)
         cmd.append(f"--onefile-tempdir-spec={{CACHE_DIR}}/{NOMBRE_EXE}/onefile_{APP['APP_VERSION']}")
     for modulo in EXCLUIR:
         cmd.append(f"--nofollow-import-to={modulo}")
@@ -220,13 +311,14 @@ def compilar_nuitka() -> Path:
         shutil.move(str(salida / f"{FUENTE.stem}.dist"), str(carpeta))
         quitar_sobrantes(carpeta)
         exe = carpeta / f"{NOMBRE_EXE}.exe"
+    copiar_documentos_legales(exe.parent)
     print(f"Listo: {exe}  ({tamano_mb(exe if ONEFILE else exe.parent):.0f} MB)")
     return exe
 
 
 # ─── Autoprueba ─────────────────────────────────────────────────────────────
 
-def autoprueba(exe: Path) -> bool:
+def autoprueba(exe: Path, intento: int = 1) -> bool:
     print(f"\nAutoprueba de {exe.name} (sin ventana, con configuración temporal)...")
     datos = Path(tempfile.mkdtemp(prefix="utilidades_autoprueba_"))
     try:
@@ -241,6 +333,13 @@ def autoprueba(exe: Path) -> bool:
             extra = {k: v for k, v in r.items() if k != "ok"}
             print(f"  {'OK   ' if r['ok'] else 'FALLO'} {nombre}  {json.dumps(extra, ensure_ascii=False)}")
         print(f"Autoprueba: {d['resultado']} ({d['ejecucion']}, Python {d['python']}, Qt {d['qt']})")
+        fallos = [n for n, r in d["pruebas"].items() if not r["ok"]]
+        if fallos == ["interfaz_sin_congelarse"] and intento == 1:
+            # Un .exe recién compilado y sin firma lo revisa el antivirus la primera vez que lanza
+            # procesos (Avast llega a pausar todo el programa unos segundos): se repite una vez.
+            print("Solo falló la medición de congelamiento: suele ser el antivirus revisando un .exe nuevo. "
+                  "Se repite la autoprueba...")
+            return autoprueba(exe, intento=2)
         return codigo == 0
     except subprocess.TimeoutExpired:
         print("Autoprueba: el .exe no terminó a tiempo.")
@@ -257,7 +356,10 @@ def main():
         print(__doc__)
         sys.exit(2)
     print(f"{APP['APP_NOMBRE']} {APP['APP_VERSION']}")
+    if not LICENCIA.exists():
+        sys.exit("Falta el archivo LICENSE en la raíz del proyecto.")
     preparar_icono()
+    escribir_avisos_de_terceros()
     todo_ok = True
     for compilar in compiladores[herramienta]:
         exe = compilar()

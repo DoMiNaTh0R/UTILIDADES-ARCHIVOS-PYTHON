@@ -1,0 +1,35 @@
+LOGO Y AVATAR: NO ESTÁN BAJO LA GPL
+===================================
+
+El código de "Utilidades de archivos" es software libre bajo la GNU GPL v3
+(archivo LICENSE). Esa licencia NO cubre estos archivos de la carpeta recursos:
+
+    logo_app.png        logo de la app
+    app.ico             el mismo logo como icono
+    avatar_DoMiN.jpg    avatar de DoMiNaTh0R
+
+© 2026 Kevin González (DoMiNaTh0R). Todos los derechos reservados.
+
+Se permite copiarlos y redistribuirlos SIN MODIFICAR únicamente como parte de
+copias de este programa (el código fuente o el .exe compilado), para que la app
+se pueda compartir tal cual.
+
+Sin permiso por escrito del autor NO se permite:
+  - usarlos en otros proyectos, productos o sitios;
+  - modificarlos o crear obras derivadas de ellos;
+  - usarlos para identificar versiones modificadas (forks) de este programa:
+    quien publique una versión modificada debe poner su propio logo y avatar.
+
+Esto no limita ningún derecho que la GPL te da sobre el código: puedes
+modificarlo y compartirlo como dice la licencia; solo reemplaza estas imágenes.
+La app funciona sin ellas (si faltan, simplemente no se muestran).
+
+
+English summary
+---------------
+The source code is licensed under the GNU GPL v3 (see LICENSE). The files listed
+above (app logo, icon and the DoMiNaTh0R avatar) are NOT covered by the GPL:
+© 2026 Kevin González (DoMiNaTh0R), all rights reserved. They may be
+redistributed unmodified only as part of copies of this program. Any other use,
+modification, or use in modified versions (forks) requires written permission;
+forks must replace them with their own images.
