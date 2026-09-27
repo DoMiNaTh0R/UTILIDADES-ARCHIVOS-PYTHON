@@ -23,7 +23,7 @@ Nuitka necesita un compilador de C: usa Visual Studio Build Tools si está insta
 descarga uno automáticamente (una sola vez).
 
 Junto al .exe (y dentro de él) van LICENSE (GNU GPL v3) y THIRD_PARTY_NOTICES.txt, que se
-genera aquí con la licencia completa de lo que se empaqueta: PyQt6, Qt, sip y Python.
+genera aquí con el mismo formato que la pestaña «Licencias»: la licencia completa de cada paquete de build_env.
 
 Al terminar ejecuta el .exe con --autoprueba (sin mostrar la ventana): prueba recursos,
 complementos de Qt y cada pestaña (incluido el JSON extra de Licencias) y muestra el resultado.
@@ -62,13 +62,13 @@ PAQUETES_INCLUIDOS = ["PyQt6", "PyQt6-Qt6", "PyQt6-sip"]
 
 
 def datos_app() -> dict:
-    """APP_NOMBRE, APP_VERSION... (y el lector de licencias) leídos del código fuente sin importarlo."""
+    """APP_NOMBRE, APP_VERSION... (y el lector y formato de licencias) leídos del código fuente sin importarlo."""
     datos = {}
     for nodo in ast.parse(FUENTE.read_text(encoding="utf-8")).body:
         if isinstance(nodo, ast.Assign) and isinstance(nodo.value, ast.Constant):
             for destino in nodo.targets:
-                if isinstance(destino, ast.Name) and (destino.id.startswith("APP_")
-                                                      or destino.id == "HELPER_ENTORNO"):
+                if isinstance(destino, ast.Name) and (destino.id.startswith("APP_") or destino.id in (
+                        "HELPER_ENTORNO", "ENCABEZADO_LICENCIAS", "ANCHO_DOC")):
                     datos[destino.id] = nodo.value.value
     return datos
 
@@ -132,8 +132,9 @@ def tamano_mb(ruta: Path) -> float:
 
 def escribir_avisos_de_terceros() -> Path:
     """
-    THIRD_PARTY_NOTICES.txt con la licencia completa de lo que va dentro del .exe. Usa el mismo
-    lector de licencias que la pestaña «Licencias» de la app, ejecutado con el Python del venv.
+    THIRD_PARTY_NOTICES.txt: el encabezado de la app y, debajo, el mismo documento que genera la
+    pestaña «Licencias» con todos los paquetes del venv de compilación (build_env). Usa el mismo
+    lector de licencias que la app, ejecutado con el Python del venv.
     """
     TRABAJO.mkdir(parents=True, exist_ok=True)
     lector, datos = TRABAJO / "leer_licencias.py", TRABAJO / "licencias_venv.json"
@@ -141,20 +142,22 @@ def escribir_avisos_de_terceros() -> Path:
     r = subprocess.run([sys.executable, str(lector), "licencias", str(datos)], capture_output=True, text=True)
     if r.returncode != 0 or not datos.exists():
         sys.exit(f"No se pudieron leer las licencias del venv:\n{r.stderr}")
+
     def normalizar(nombre: str) -> str:          # PEP 503: PyQt6_sip == pyqt6-sip
         return re.sub(r"[-_.]+", "-", nombre).lower()
 
-    instalados = {normalizar(p["nombre"]): p for p in json.loads(datos.read_text(encoding="utf-8"))["paquetes"]}
-    componentes = []
+    paquetes = json.loads(datos.read_text(encoding="utf-8"))["paquetes"]
+    instalados = {normalizar(p["nombre"]) for p in paquetes}
     for nombre in PAQUETES_INCLUIDOS:
-        p = instalados.get(normalizar(nombre))
-        if p is None:
-            sys.exit(f"Falta {nombre} en el venv:  pip install -r requirements.txt")
-        componentes.append((p["nombre"], p["version"], p["tipo"], p["texto"]))
-    licencia_python = Path(sys.base_prefix) / "LICENSE.txt"
-    texto_python = (licencia_python.read_text(encoding="utf-8", errors="replace") if licencia_python.exists()
-                    else "Consulta https://docs.python.org/3/license.html")
-    componentes.append(("Python", sys.version.split()[0], "PSF-2.0", texto_python))
+        if normalizar(nombre) not in instalados:
+            sys.exit(f"Falta {nombre} en el venv: ejecuta build_env.bat")
+    filas = sorted(((p["nombre"], p["version"], p["tipo"], p["texto"]) for p in paquetes),
+                   key=lambda x: x[0].lower())
+
+    ancho = APP["ANCHO_DOC"]
+
+    def titulo_doc(texto: str) -> str:            # igual que en la pestaña «Licencias»
+        return "=" * ancho + "\n" + texto.center(ancho) + "\n" + "=" * ancho
 
     linea = "=" * 72
     partes = [linea, "AVISOS DE TERCEROS / THIRD-PARTY NOTICES".center(72), linea, "",
@@ -164,12 +167,18 @@ def escribir_avisos_de_terceros() -> Path:
               "Qt se distribuye bajo la LGPL v3: sus bibliotecas van como archivos DLL separados (Qt6*.dll)",
               "que se pueden reemplazar por otra versión compatible; su código fuente está en https://download.qt.io/.",
               "Robocopy, PowerShell y winget son programas de Windows que la app solo ejecuta: no van incluidos.",
-              "", "Resumen:"]
-    partes += [f"  {nombre} {version}  ·  {tipo}" for nombre, version, tipo, _ in componentes]
-    for nombre, version, tipo, texto in componentes:
-        partes += ["", "-" * 72, f"{nombre} {version}  ·  {tipo}", "-" * 72, "", texto.strip()]
-    AVISOS.write_text("\n".join(partes) + "\n", encoding="utf-8")
-    print("Avisos de terceros: " + ", ".join(f"{nombre} ({tipo})" for nombre, _, tipo, _ in componentes))
+              ""]
+    # Desde aquí, exactamente el documento de la pestaña «Licencias»
+    partes += [titulo_doc("LICENSE INFORMATION DOCUMENT"), ""]
+    partes.append(APP["ENCABEZADO_LICENCIAS"].format(app="esta aplicación").strip())
+    partes += ["", "", titulo_doc("SUMMARY OF INCLUDED PACKAGES"), ""]
+    partes += [f"{nombre}=={version}" for nombre, version, _, _ in filas]
+    partes += ["", "", titulo_doc("DETAILED LICENSE TEXTS"), ""]
+    for nombre, version, tipo, texto in filas:
+        partes += [f"--- {nombre} ({version}) ---", f"License Type: {tipo}", "", texto, "", "-" * ancho, ""]
+    with open(AVISOS, "w", encoding="utf-8", newline="\r\n") as fh:
+        fh.write("\n".join(partes).rstrip() + "\n")
+    print(f"Avisos de terceros: {len(filas)} paquetes del venv ({AVISOS.stat().st_size // 1024} KB)")
     return AVISOS
 
 

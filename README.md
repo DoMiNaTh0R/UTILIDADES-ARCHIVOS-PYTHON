@@ -85,7 +85,7 @@ build_env\Scripts\python.exe compilar.py todo
 ```
 
 - `--consola`: compila con ventana de consola, para ver errores.
-- Junto al `.exe` (y dentro de él) van `LICENSE`, `LICENCIA_LOGO_Y_AVATAR.txt` y `THIRD_PARTY_NOTICES.txt`, que `compilar.py` genera con la licencia completa de lo que se empaqueta: PyQt6 (GPL v3), Qt (LGPL v3), sip (BSD) y Python (PSF).
+- Junto al `.exe` (y dentro de él) van `LICENSE`, `LICENCIA_LOGO_Y_AVATAR.txt` y `THIRD_PARTY_NOTICES.txt`, que `compilar.py` genera con el mismo formato que la pestaña *Licencias*: la licencia completa de cada paquete de `build_env` (PyQt6, Qt, PyInstaller…).
 - Al terminar, `compilar.py` ejecuta el `.exe` con **`--autoprueba`**: sin mostrar la ventana y con una configuración temporal, prueba los recursos, los complementos de Qt y cada pestaña con archivos de prueba (incluido el JSON extra de Licencias y un análisis de winget de solo lectura), y mide cuánto se traba la interfaz. Imprime `OK`/`FALLO` por prueba.
 - Nuitka necesita un compilador de C: usa Visual Studio Build Tools si lo tienes; si no, lo descarga solo la primera vez.
 - La versión, el nombre, el autor y la licencia del `.exe` (clic derecho → Propiedades → Detalles) salen de las constantes `APP_*` al inicio de `utilidades_archivos.py`. Para una versión nueva basta con cambiar `APP_VERSION` ahí.
