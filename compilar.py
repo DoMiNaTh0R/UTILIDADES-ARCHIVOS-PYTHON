@@ -1,14 +1,11 @@
 # Utilidades de archivos · Copyright (C) 2026  Kevin González (DoMiNaTh0R)
 # SPDX-License-Identifier: GPL-3.0-or-later  (ver LICENSE)
 """
-Compila Utilidades de archivos con PyInstaller o con Nuitka.
+Compila Utilidades de archivos con PyInstaller.
 
 Uso (con el venv del proyecto, build_env; lo crea build_env.bat):
-    python compilar.py pyinstaller              carpeta (recomendado: arranca más rápido)
-    python compilar.py pyinstaller --onefile    un solo .exe
-    python compilar.py nuitka                   carpeta, compilado a código C nativo
-    python compilar.py nuitka --onefile         un solo .exe
-    python compilar.py todo                     PyInstaller y Nuitka (carpeta)
+    python compilar.py              carpeta (recomendado: arranca más rápido)
+    python compilar.py --onefile    un solo .exe
 
 Opciones:
     --consola       con ventana de consola (para diagnosticar errores)
@@ -16,11 +13,6 @@ Opciones:
 
 Resultado:
     dist\\pyinstaller\\UtilidadesArchivos\\UtilidadesArchivos.exe   (--onefile: dist\\pyinstaller\\UtilidadesArchivos.exe)
-    dist\\nuitka\\UtilidadesArchivos\\UtilidadesArchivos.exe        (--onefile: dist\\nuitka\\UtilidadesArchivos.exe)
-
-La configuración (utilidades_config.json) se crea junto al .exe la primera vez que se abre.
-Nuitka necesita un compilador de C: usa Visual Studio Build Tools si está instalado; si no,
-descarga uno automáticamente (una sola vez).
 
 Junto al .exe (y dentro de él) van LICENSE (GNU GPL v3) y THIRD_PARTY_NOTICES.txt, que se
 genera aquí con el mismo formato que la pestaña «Licencias»: la licencia completa de cada paquete de build_env.
@@ -258,73 +250,6 @@ def compilar_pyinstaller() -> Path:
     return exe
 
 
-# ─── Nuitka ─────────────────────────────────────────────────────────────────
-
-def traduccion_qt() -> Path | None:
-    """qtbase_es.qm: los menús propios de Qt (Copiar, Pegar…) en español."""
-    import importlib.util
-    spec = importlib.util.find_spec("PyQt6")
-    if spec is None or not spec.submodule_search_locations:
-        return None
-    ruta = Path(list(spec.submodule_search_locations)[0]) / "Qt6" / "translations" / "qtbase_es.qm"
-    return ruta if ruta.is_file() else None
-
-
-def compilar_nuitka() -> Path:
-    try:
-        import nuitka  # noqa: F401
-    except ImportError:
-        sys.exit("Nuitka no está instalado:  ejecuta build_env.bat")
-    salida = TRABAJO / "nuitka"
-    destino = DIST / "nuitka"
-    version = ".".join(version_windows())
-    cmd = [sys.executable, "-m", "nuitka", str(FUENTE),
-           "--onefile" if ONEFILE else "--standalone",
-           "--enable-plugin=pyqt6",
-           f"--windows-console-mode={'force' if CONSOLA else 'disable'}",
-           f"--include-data-files={LICENCIA}=LICENSE",
-           f"--include-data-files={AVISOS}=THIRD_PARTY_NOTICES.txt",
-           f"--output-dir={salida}",
-           f"--output-filename={NOMBRE_EXE}.exe",
-           f"--company-name={AUTOR_EXE}",
-           f"--product-name={APP['APP_NOMBRE']}",
-           f"--file-description={APP['APP_NOMBRE']}",
-           f"--copyright={COPYRIGHT}",
-           f"--file-version={version}", f"--product-version={version}",
-           "--assume-yes-for-downloads", "--remove-output"]
-    if ICONO.exists():
-        cmd.append(f"--windows-icon-from-ico={ICONO}")
-    if RECURSOS.is_dir():
-        cmd.append(f"--include-data-dir={RECURSOS}=recursos")
-    traduccion = traduccion_qt()
-    if traduccion is not None:      # Nuitka no incluye las traducciones de Qt (PyInstaller sí)
-        cmd.append(f"--include-data-files={traduccion}=traducciones/{traduccion.name}")
-    if ONEFILE:
-        # Carpeta fija de extracción: a partir del segundo arranque abre al instante
-        # (%LOCALAPPDATA%\UtilidadesArchivos\onefile_<versión>, junto a la configuración y los registros)
-        cmd.append(f"--onefile-tempdir-spec={{CACHE_DIR}}/{NOMBRE_EXE}/onefile_{APP['APP_VERSION']}")
-    for modulo in EXCLUIR:
-        cmd.append(f"--nofollow-import-to={modulo}")
-    print(f"\n=== Nuitka ({'un solo .exe' if ONEFILE else 'carpeta'}) — puede tardar varios minutos ===")
-    if subprocess.run(cmd, cwd=RAIZ).returncode != 0:
-        sys.exit("Nuitka falló.")
-
-    destino.mkdir(parents=True, exist_ok=True)
-    if ONEFILE:
-        exe = destino / f"{NOMBRE_EXE}.exe"
-        borrar(exe)
-        shutil.move(str(salida / f"{NOMBRE_EXE}.exe"), str(exe))
-    else:
-        carpeta = destino / NOMBRE_EXE
-        borrar(carpeta)
-        shutil.move(str(salida / f"{FUENTE.stem}.dist"), str(carpeta))
-        quitar_sobrantes(carpeta)
-        exe = carpeta / f"{NOMBRE_EXE}.exe"
-    copiar_documentos_legales(exe.parent)
-    print(f"Listo: {exe}  ({tamano_mb(exe if ONEFILE else exe.parent):.0f} MB)")
-    return exe
-
-
 # ─── Autoprueba ─────────────────────────────────────────────────────────────
 
 def autoprueba(exe: Path, intento: int = 1) -> bool:
@@ -358,10 +283,9 @@ def autoprueba(exe: Path, intento: int = 1) -> bool:
 
 
 def main():
-    herramienta = next((a for a in sys.argv[1:] if not a.startswith("--")), "").lower()
-    compiladores = {"pyinstaller": [compilar_pyinstaller], "nuitka": [compilar_nuitka],
-                    "todo": [compilar_pyinstaller, compilar_nuitka]}
-    if herramienta not in compiladores:
+    # «pyinstaller» como primer argumento se acepta igual (así se llamaba antes)
+    desconocidos = [a for a in sys.argv[1:] if not a.startswith("--") and a.lower() != "pyinstaller"]
+    if desconocidos or "--help" in sys.argv:
         print(__doc__)
         sys.exit(2)
     print(f"{APP['APP_NOMBRE']} {APP['APP_VERSION']}")
@@ -369,12 +293,9 @@ def main():
         sys.exit("Falta el archivo LICENSE en la raíz del proyecto.")
     preparar_icono()
     escribir_avisos_de_terceros()
-    todo_ok = True
-    for compilar in compiladores[herramienta]:
-        exe = compilar()
-        if "--sin-prueba" not in sys.argv:
-            todo_ok = autoprueba(exe) and todo_ok
-    sys.exit(0 if todo_ok else 1)
+    exe = compilar_pyinstaller()
+    if "--sin-prueba" not in sys.argv and not autoprueba(exe):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
