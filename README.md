@@ -4,7 +4,7 @@
 
 App de escritorio para Windows (PyQt6) con utilidades para copiar, ordenar y documentar archivos y entornos de Python, más un actualizador de programas con winget que revisa cada instalador antes de ejecutarlo.
 
-**Versión 1.3.0** · Creada por **DoMiNaTh0R** (Kevin González) · © 2026 · Licencia [GNU GPL v3](LICENSE)
+**Versión 1.3.1** · Creada por **DoMiNaTh0R** (Kevin González) · © 2026 · Licencia [GNU GPL v3](LICENSE)
 
 Para instalarla o compilarla, mira **[INSTALL.md](INSTALL.md)**.
 
@@ -12,7 +12,7 @@ Para instalarla o compilarla, mira **[INSTALL.md](INSTALL.md)**.
 
 | Pestaña | Qué hace |
 |---|---|
-| **Copiar** | Robocopy con carpetas y archivos a omitir, simulación y salida en vivo, con %, velocidad y tiempo restante. Elige los hilos según el disco (USB, HDD o SSD). Con `/MIR` o `/PURGE` te enseña antes qué se borraría del destino y pregunta. Al terminar, una tabla con lo que hay en el origen, lo que se copia, lo que se omite, lo que solo está en el destino y cómo queda el destino, más otra con los tiempos. |
+| **Copiar** | Robocopy con carpetas y archivos a omitir (por nombre o por su ruta dentro del origen), simulación y salida en vivo, con %, velocidad y tiempo restante (medidos con lo que robocopy escribe de verdad, también con `/MT`). Elige los hilos según el disco (USB, HDD o SSD). Con `/MIR` o `/PURGE` te enseña antes qué se borraría del destino y pregunta. Al terminar, una tabla con lo que hay en el origen, lo que se copia, lo que se omite, lo que solo está en el destino y cómo queda el destino, más otra con los tiempos. |
 | **Organizar** | Cuenta los archivos de una carpeta por extensión y mueve o copia los que elijas a `<destino>\<extensión>\`, sin sobrescribir nada. |
 | **Listar rutas** | Un `.txt` con las rutas de archivos y carpetas, con filtros por extensión y carpetas a ignorar. |
 | **Info entorno** | Python y paquetes de un venv, un entorno de conda o el Python global, y su `requirements.txt` (en conda, también `environment.yml`). Lo de conda y el global se guarda en el Escritorio. |
@@ -29,7 +29,7 @@ Todo corre en segundo plano: la ventana no se congela. Tema claro y oscuro, y se
 **Cada paquete** se verifica antes de instalarlo:
 - SHA256 y sitio de descarga del manifiesto, y el mismo SHA256 comparado con el que publica GitHub cuando el instalador viene de ahí.
 - Firma digital opcional (con PowerShell), también la de los instaladores que vienen dentro de un `.zip` o `.nupkg` y la de los paquetes MSIX. Para autores que no firman (como 7-Zip) hay una lista de «sin firma, pero confío».
-- Si el programa está abierto (te dice quién lo usa y puede finalizarlos por ti), si Windows Installer está ocupado (espera y reintenta) y si winget lo desinstalaría antes de instalar la versión nueva (pregunta antes). En «Opciones» puedes hacer que los finalice sin preguntar (desactivado de fábrica; al pulsar «Actualizar» te avisa). Nunca toca los procesos de Windows.
+- Si el programa está abierto (te dice quién lo usa y puede finalizarlos por ti; sus propios servicios los detiene y al terminar los vuelve a iniciar), si Windows Installer está ocupado (espera y reintenta) y si winget lo desinstalaría antes de instalar la versión nueva (pregunta antes). En «Opciones» puedes hacer que los finalice sin preguntar (desactivado de fábrica; al pulsar «Actualizar» te avisa). Nunca toca los procesos de Windows.
 
 **Durante la actualización** instala de uno en uno, pero mientras instala uno ya va verificando y descargando los siguientes; winget reutiliza esa descarga (vuelve a comprobar su SHA256). Muestra el % real de cada descarga y en qué fase va. Al terminar vuelve a buscar y abre un reporte con la versión antes y después de cada programa, el motivo de cada fallo y un botón para reintentar.
 

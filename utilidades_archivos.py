@@ -50,6 +50,7 @@ Se compila con PyInstaller (ver INSTALL.md y compilar.py). Tras compilar:
 
 from __future__ import annotations
 
+import bisect
 import codecs
 import copy
 import fnmatch
@@ -67,6 +68,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+from array import array
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -88,7 +90,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QApplicatio
 APP_NOMBRE = "Utilidades de archivos"
 APP_ID = "UtilidadesArchivos"            # nombre del .exe y de su carpeta de datos
 APP_EDITOR = "DEUS MACHINA"              # carpeta del editor en %LOCALAPPDATA%: los datos van en <editor>\<APP_ID>
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 APP_AUTOR = "DoMiNaTh0R"
 APP_AUTOR_NOMBRE = "Kevin González"
 APP_ANIO = "2026"
@@ -697,7 +699,8 @@ QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
 QScrollBar::handle:hover {{ background: {p['borde_fuerte']}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
-QMessageBox QPushButton {{ min-width: 72px; }}
+/* Con min-width, QMessageBox encogía los botones largos y cortaba su texto: más relleno en su lugar */
+QMessageBox QPushButton {{ padding: {SPACING_SM}px {SPACING_LG}px; }}
 
 /* ─── Menús (clic derecho: Copiar, Pegar…) ───────── */
 QMenu {{
@@ -2516,6 +2519,24 @@ def limpiar_ruta_robocopy(r: str) -> str:
     return r
 
 
+def es_ruta_relativa_omitida(carpeta: str) -> bool:
+    """«z OLD\\V2.1 FINAL\\tools»: una ruta dentro del origen (no un nombre suelto ni una ruta completa)."""
+    c = carpeta.strip().strip("\\/")
+    return bool(re.search(r"[\\/]", c)) and not re.match(r"[A-Za-z]:", c) and not carpeta.strip().startswith("\\\\")
+
+
+def completar_carpeta_omitida(carpeta: str, origen: str) -> str:
+    """
+    /XD de robocopy solo entiende nombres (build*) o rutas completas: con una ruta dentro del origen
+    («z OLD\\V2.1 FINAL\\tools») no omitía nada. Se completa con el origen; así /MIR tampoco la borra del
+    destino (probado con robocopy). Los nombres y las rutas completas quedan igual.
+    """
+    if not es_ruta_relativa_omitida(carpeta):
+        return carpeta.strip()
+    relativa = re.sub(r"^\.\\", "", carpeta.strip().replace("/", "\\").strip("\\"))
+    return ntpath.join(origen, relativa)
+
+
 # Filas del resumen final con 6 números (Total, Copiado, Omitido, No coinc., Error, Extras).
 # Se identifican por su orden (Carpetas, Archivos, Bytes), no por el texto, que cambia con el idioma.
 RE_RESUMEN = re.compile(r"^\s*[^\d\s][^:]*:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$")
@@ -2763,6 +2784,7 @@ class ProgresoRobocopy:
     Lee la salida de robocopy (con /BYTES) y lleva la cuenta de bytes y archivos copiados.
     Cada línea de archivo trae su tamaño; el archivo anterior se da por terminado cuando
     aparece el siguiente, y el % por archivo (sin /MT) afina el avance dentro de uno grande.
+    Con /MT esa cuenta no sirve (escribe la línea al EMPEZAR cada archivo): ahí manda hechos_escritos().
     """
     RE_ARCHIVO = re.compile(r"\t\s*(\d+)\t(.*\S)\s*$")
     RE_GUIONES = re.compile(r"^\s*-{20,}\s*$")
@@ -2776,6 +2798,8 @@ class ProgresoRobocopy:
         self._pct = 0.0
         self.bytes_hechos = 0
         self.archivos_hechos = 0
+        self.anunciados = 0                 # bytes de todos los archivos que robocopy ya nombró
+        self._acumulado = array("q")        # total anunciado tras cada archivo, en el orden de robocopy
 
     def alimentar(self, texto: str):
         self._buffer += texto
@@ -2806,6 +2830,8 @@ class ProgresoRobocopy:
             return
         self._cerrar_actual()
         self._actual, self._pct = int(m.group(1)), 0.0
+        self.anunciados += self._actual
+        self._acumulado.append(self.anunciados)
 
     def _cerrar_actual(self):
         if self._actual is not None:
@@ -2819,6 +2845,50 @@ class ProgresoRobocopy:
     def hechos(self) -> tuple[float, int]:
         parcial = self._actual * min(self._pct, 100.0) / 100 if self._actual else 0
         return self.bytes_hechos + parcial, self.archivos_hechos
+
+    def hechos_escritos(self, escritos: int) -> tuple[float, int]:
+        """
+        Con los bytes que robocopy escribió de verdad (ContadorEscrituras). Los archivos terminados se estiman
+        por el orden en que los nombró; con /MT su salida llega a tirones, así que pueden ir por detrás.
+        """
+        return escritos, bisect.bisect_right(self._acumulado, escritos)
+
+
+class ContadorEscrituras:
+    """
+    Bytes que escribió un proceso, según Windows (GetProcessIoCounters). Con robocopy son los bytes copiados
+    de verdad, también con /MT. escritos() da None si no se pueden leer.
+    """
+
+    def __init__(self, pid: int):
+        self._h = None
+        if not ES_WINDOWS or not pid:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            self._k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            self._k32.OpenProcess.restype = wintypes.HANDLE
+            self._k32.GetProcessIoCounters.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+            self._k32.GetProcessIoCounters.restype = wintypes.BOOL
+            self._k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            self._contadores = (ctypes.c_ulonglong * 6)()      # IO_COUNTERS
+            self._ref = ctypes.byref(self._contadores)
+            # Solo consultar (PROCESS_QUERY_LIMITED_INFORMATION): no necesita permisos de administrador
+            self._h = self._k32.OpenProcess(0x1000, False, int(pid)) or None
+        except (OSError, AttributeError):
+            self._h = None
+
+    def escritos(self) -> int | None:
+        if self._h is None or not self._k32.GetProcessIoCounters(self._h, self._ref):
+            return None
+        return int(self._contadores[4])                         # WriteTransferCount
+
+    def cerrar(self):
+        if self._h is not None:
+            self._k32.CloseHandle(self._h)
+            self._h = None
 
 
 class PaginaCopiar(Pagina):
@@ -2874,7 +2944,8 @@ class PaginaCopiar(Pagina):
         # Exclusiones
         card, lay = tarjeta("Qué omitir")
         self.lista_carpetas = ListaEditable(
-            "CARPETAS A OMITIR (/XD)", "Nombres o comodines: node_modules, .git, build*…",
+            "CARPETAS A OMITIR (/XD)", "Nombres o comodines (node_modules, .git, build*…), que omiten todas las "
+            "que se llamen así, o una ruta dentro del origen (z OLD\\V2.1 FINAL\\tools), que omite solo esa.",
             "Agregar carpeta o patrón (varios separados por coma)")
         self.lista_archivos = ListaEditable(
             "ARCHIVOS A OMITIR (/XF)", "Nombres o comodines: *.tmp, *.log, Thumbs.db…",
@@ -2958,6 +3029,9 @@ class PaginaCopiar(Pagina):
         self._reloj = QTimer(self)
         self._reloj.setInterval(500)
         self._reloj.timeout.connect(self._actualizar_progreso)
+        self._contador: ContadorEscrituras | None = None
+        self._bytes_salida = 0          # lo que robocopy escribió en su salida (no son datos copiados)
+        self._multihilo = False
 
         for sig in (self.origen.cambiado, self.destino.cambiado, self.chk_carpeta.toggled,
                     self.lista_carpetas.cambiado, self.lista_archivos.cambiado,
@@ -3149,9 +3223,9 @@ class PaginaCopiar(Pagina):
         return ntpath.join(destino, nombre)
 
     def _base_args(self, extra_xd: list[str] | None = None) -> list[str]:
-        args = [limpiar_ruta_robocopy(self.origen.texto()) or "<origen>",
-                self.destino_efectivo() or "<destino>", "/E"]
-        carpetas = self.lista_carpetas.activos() + (extra_xd or [])
+        origen = limpiar_ruta_robocopy(self.origen.texto()) or "<origen>"
+        args = [origen, self.destino_efectivo() or "<destino>", "/E"]
+        carpetas = [completar_carpeta_omitida(c, origen) for c in self.lista_carpetas.activos()] + (extra_xd or [])
         if carpetas:
             args += ["/XD", *carpetas]
         archivos = self.lista_archivos.activos()
@@ -3214,6 +3288,18 @@ class PaginaCopiar(Pagina):
         if norm(origen) == norm(destino):
             self.error("El origen y el destino son la misma carpeta.")
             return
+        # Robocopy rechaza la copia entera («parámetro no válido») si una ruta lleva comodines
+        con_comodin = [c for c in self.lista_carpetas.activos() if re.search(r"[\\/]", c.strip().strip("\\/"))
+                       and re.search(r"[*?]", c)]
+        if con_comodin:
+            self.error(f"Robocopy no acepta comodines dentro de una ruta: «{con_comodin[0]}». Usa un nombre con "
+                       "comodín (build*), que omite todas las que se llamen así, o la ruta sin comodines.")
+            return
+        for c in self.lista_carpetas.activos():
+            ruta = completar_carpeta_omitida(c, limpiar_ruta_robocopy(origen))
+            if ruta != c.strip() and not Path(ruta).is_dir():
+                self.consola.agregar(f"⚠ «{c}» no existe dentro del origen, así que no omite nada (la ruta es a "
+                                     "partir de la carpeta de origen).", "aviso")
         extra_xd = []
         if esta_dentro(destino, origen):
             r = QMessageBox.question(
@@ -3276,6 +3362,8 @@ class PaginaCopiar(Pagina):
         self._abrir_registro()
         self._t_inicio = time.monotonic()
         self._muestras.clear()
+        self._contador, self._bytes_salida = None, 0
+        self._multihilo = any(a.upper().startswith("/MT") for a in self._args_copia)
         if self._progreso is not None:
             self._reloj.start()
         self._lanzar_proceso(self._args_copia)
@@ -3283,10 +3371,12 @@ class PaginaCopiar(Pagina):
     def _leer(self):
         if self.proceso is None:
             return
-        texto = self._decoder.decode(bytes(self.proceso.readAllStandardOutput()))
+        datos = bytes(self.proceso.readAllStandardOutput())
+        texto = self._decoder.decode(datos)
         if self._fase == "calculo":
             self._salida_calculo.append(texto)
             return
+        self._bytes_salida += len(datos)
         self._final_salida = (self._final_salida + texto)[-8000:]
         if self._borra:
             self._anotar_borrados(texto)
@@ -3461,11 +3551,30 @@ class PaginaCopiar(Pagina):
         self.consola.agregar(f"Tiempo total: {formatear_duracion(duracion)} · {n:,} archivos · "
                              f"{formatear_bytes(b)}{velocidad}", "ok")
 
+    def _copiado_hasta_ahora(self) -> tuple[float, int]:
+        """
+        (bytes, archivos) copiados. Los bytes son los que robocopy escribió de verdad: con /MT escribe la
+        línea de cada archivo al empezarlo, y contar por las líneas daba 99.9 % en cuanto arrancaba uno grande
+        y ahí se quedaba. Sin ese contador, o si no avanza (copia que hace el servidor de red), por las líneas.
+        """
+        if self._contador is None and self.proceso is not None and self.proceso.processId():
+            self._contador = ContadorEscrituras(self.proceso.processId())
+        escritos = self._contador.escritos() if self._contador is not None else None
+        if escritos is not None:
+            escritos = max(0, escritos - self._bytes_salida)
+            if escritos or not self._progreso.anunciados or time.monotonic() - self._t_inicio < 15:
+                return self._progreso.hechos_escritos(escritos)
+        return self._progreso.hechos()
+
     def _actualizar_progreso(self):
         if self._progreso is None or self._fase != "copia":
             return
         ahora = time.monotonic()
-        b, n = self._progreso.hechos()
+        b, n = self._copiado_hasta_ahora()
+        if self._totales and self._totales["bytes"]:
+            b = min(b, self._totales["bytes"])     # reintentos (/R) vuelven a escribir lo mismo
+            if self._multihilo:                     # con /MT nombra los archivos a tirones: se estiman
+                n = max(n, int(self._totales["archivos"] * b / self._totales["bytes"]))
         trabajo = b + n * COSTO_POR_ARCHIVO
         # Velocidad con los últimos ~20 s: reacciona a cambios (archivos grandes/pequeños)
         self._muestras.append((ahora, trabajo, b))
@@ -3534,6 +3643,9 @@ class PaginaCopiar(Pagina):
 
     def _fin(self):
         self._reloj.stop()
+        if self._contador is not None:
+            self._contador.cerrar()
+            self._contador = None
         self._cerrar_registro()
         self._fase = None
         self.set_ocupado(False)
@@ -5307,7 +5419,7 @@ def script_procesos_en(carpeta: str) -> str:
             "$_.FileName.StartsWith($u, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1); "
             "if ($m.Count) { [ordered]@{ Nombre = $p.ProcessName; Id = $p.Id; Sesion = $p.SessionId; "
             "Descripcion = $(try { $p.Description } catch { $null }); Titulo = $p.MainWindowTitle; "
-            "Archivo = $m[0].ModuleName } } } catch {} }); "
+            "Archivo = $m[0].ModuleName; Ruta = $(try { $p.Path } catch { $null }) } } } catch {} }); "
             "'" + MARCA_JSON + "' + (ConvertTo-Json -InputObject $r -Compress)")
 
 
@@ -5334,17 +5446,37 @@ PROCESOS_PROTEGIDOS = frozenset({
 })
 
 
-def separar_finalizables(procesos: list) -> tuple[list[dict], list[dict]]:
+def dentro_de_carpeta(ruta: str, carpeta: str) -> bool:
+    if not ruta or not carpeta:
+        return False
+    return os.path.normcase(ruta).startswith(os.path.normcase(carpeta.rstrip("\\/")) + os.sep)
+
+
+def motivo_intocable(x: dict) -> str:
+    """Por qué no se finaliza un proceso que separar_finalizables dejó fuera."""
+    if str(x.get("Nombre") or "").lower() in PROCESOS_PROTEGIDOS or x.get("Sesion") != 0:
+        return "de Windows"
+    if not x.get("Ruta"):
+        return "servicio del sistema"
+    if dentro_de_carpeta(x["Ruta"], os.environ.get("SystemRoot", r"C:\Windows")):
+        return "de Windows"
+    return "servicio de otro programa"
+
+
+def separar_finalizables(procesos: list, carpeta: str = "") -> tuple[list[dict], list[dict]]:
     """
-    (los que se pueden finalizar, los que no). No se tocan los de Windows (PROCESOS_PROTEGIDOS) ni los
-    servicios (sesión 0): el instalador detiene sus propios servicios.
+    (los que se pueden finalizar, los que no). Nunca los de Windows (PROCESOS_PROTEGIDOS) ni los servicios
+    (sesión 0) de fuera de la carpeta del programa. Los servicios del propio programa (los de Logitech G HUB,
+    por ejemplo) sí: se detienen y al terminar se vuelven a iniciar. Antes contaban como «de Windows» y, si
+    solo quedaban ellos, no salía la opción de finalizar.
     """
     si, no = [], []
     for x in procesos or []:
         if not isinstance(x, dict) or not x.get("Id"):
             continue
-        protegido = (str(x.get("Nombre") or "").lower() in PROCESOS_PROTEGIDOS or x.get("Sesion") == 0
-                     or x.get("Id") == os.getpid())
+        protegido = str(x.get("Nombre") or "").lower() in PROCESOS_PROTEGIDOS or x.get("Id") == os.getpid()
+        if x.get("Sesion") == 0 and not dentro_de_carpeta(str(x.get("Ruta") or ""), carpeta):
+            protegido = True
         (no if protegido else si).append(x)
     return si, no
 
@@ -5352,23 +5484,33 @@ def separar_finalizables(procesos: list) -> tuple[list[dict], list[dict]]:
 def script_finalizar_procesos(procesos: list[dict], espera: int = 10) -> str:
     """
     Pide a cada proceso que se cierre (como pulsar la X: un navegador guarda sus pestañas) y, si sigue
-    abierto pasados `espera` segundos, lo finaliza (Stop-Process -Force). Solo toca el proceso si su Id
-    sigue siendo del mismo programa. Devuelve [{Id, Nombre, Resultado: cerrado|finalizado|error, Error}].
+    abierto pasados `espera` segundos, lo finaliza (Stop-Process -Force). Los servicios (sesión 0) se
+    detienen con el Administrador de servicios, que es lo limpio (matarlos puede hacer que Windows los
+    reinicie). Solo toca el proceso si su Id sigue siendo del mismo programa.
+    Devuelve [{Id, Nombre, Resultado: cerrado|detenido|finalizado|error, Servicio, Error}].
     """
-    lista = json.dumps([{"Id": int(x["Id"]), "Nombre": str(x.get("Nombre") or "")} for x in procesos])
+    lista = json.dumps([{"Id": int(x["Id"]), "Nombre": str(x.get("Nombre") or ""), "Sesion": x.get("Sesion")}
+                        for x in procesos])
     # Sin @(): en PowerShell 5.1, ConvertFrom-Json entrega la lista entera como un solo objeto
     return ("$o = ConvertFrom-Json " + ps_texto(lista) + "; "
             "function Vivo($x) { $p = Get-Process -Id $x.Id -ErrorAction SilentlyContinue; "
             "if ($p -and $p.ProcessName -eq $x.Nombre) { $p } else { $null } }; "
-            "$pedido = $false; foreach ($x in $o) { $p = Vivo $x; if ($p -and $p.MainWindowHandle -ne 0) { "
-            "try { [void]$p.CloseMainWindow(); $pedido = $true } catch {} } }; "
+            "$pedido = $false; $serv = @{}; foreach ($x in $o) { $p = Vivo $x; if (-not $p) { continue }; "
+            "if ($x.Sesion -eq 0) { "
+            "foreach ($s in @(Get-CimInstance Win32_Service -Filter ('ProcessId = ' + $x.Id) -ErrorAction SilentlyContinue)) { "
+            "try { (Get-Service -Name $s.Name -ErrorAction Stop).Stop(); $k = [string]$x.Id; "
+            "if (-not $serv.ContainsKey($k)) { $serv[$k] = @() }; $serv[$k] += $s.Name; $pedido = $true } catch {} } } "
+            "elseif ($p.MainWindowHandle -ne 0) { try { [void]$p.CloseMainWindow(); $pedido = $true } catch {} } }; "
             "$fin = (Get-Date).AddSeconds($(if ($pedido) { " + str(int(espera)) + " } else { 0 })); "
             "while ((Get-Date) -lt $fin -and @($o | Where-Object { Vivo $_ }).Count) { Start-Sleep -Milliseconds 300 }; "
-            "$r = @(foreach ($x in $o) { $p = Vivo $x; "
-            "if (-not $p) { [ordered]@{ Id = $x.Id; Nombre = $x.Nombre; Resultado = 'cerrado' }; continue }; "
+            "$r = @(foreach ($x in $o) { $p = Vivo $x; $k = [string]$x.Id; "
+            "$sv = $(if ($serv.ContainsKey($k)) { $serv[$k] -join ', ' } else { $null }); "
+            "if (-not $p) { [ordered]@{ Id = $x.Id; Nombre = $x.Nombre; "
+            "Resultado = $(if ($sv) { 'detenido' } else { 'cerrado' }); Servicio = $sv }; continue }; "
             "try { Stop-Process -Id $x.Id -Force -ErrorAction Stop; "
-            "[ordered]@{ Id = $x.Id; Nombre = $x.Nombre; Resultado = 'finalizado' } } "
-            "catch { [ordered]@{ Id = $x.Id; Nombre = $x.Nombre; Resultado = 'error'; Error = $_.Exception.Message } } }); "
+            "[ordered]@{ Id = $x.Id; Nombre = $x.Nombre; Resultado = 'finalizado'; Servicio = $sv } } "
+            "catch { [ordered]@{ Id = $x.Id; Nombre = $x.Nombre; Resultado = 'error'; Servicio = $sv; "
+            "Error = $_.Exception.Message } } }); "
             "Start-Sleep -Milliseconds 500; "
             "'" + MARCA_JSON + "' + (ConvertTo-Json -InputObject $r -Compress)")
 
@@ -5380,12 +5522,33 @@ def resumir_finalizados(resultado: list) -> tuple[list[str], list[str]]:
     for x in resultado or []:
         if not isinstance(x, dict):
             continue
-        if x.get("Resultado") in ("cerrado", "finalizado"):
-            cerrados[x.get("Nombre") or "?"] = cerrados.get(x.get("Nombre") or "?", 0) + 1
+        if x.get("Resultado") in ("cerrado", "detenido", "finalizado"):
+            nombre = (x.get("Nombre") or "?") + (f" (servicio {x['Servicio']})" if x.get("Servicio") else "")
+            cerrados[nombre] = cerrados.get(nombre, 0) + 1
         else:
             motivo = str(x.get("Error") or "no se pudo").strip().rstrip(".")
             fallos.append(f"{x.get('Nombre') or '?'} ({x.get('Id')}): {motivo}")
     return [n + (f" ({c} procesos)" if c > 1 else "") for n, c in cerrados.items()], fallos
+
+
+def servicios_detenidos(resultado: list) -> list[str]:
+    """Los servicios que script_finalizar_procesos detuvo (para volver a iniciarlos al terminar)."""
+    nombres = []
+    for x in resultado or []:
+        if isinstance(x, dict) and x.get("Servicio") and x.get("Resultado") in ("detenido", "finalizado"):
+            nombres += [n.strip() for n in str(x["Servicio"]).split(",") if n.strip() and n.strip() not in nombres]
+    return nombres
+
+
+def script_iniciar_servicios(nombres: list[str]) -> str:
+    """Vuelve a iniciar los servicios que se detuvieron. [{Nombre, Resultado: iniciado|ya|no existe|error, Error}]."""
+    return ("$o = ConvertFrom-Json " + ps_texto(json.dumps(list(nombres))) + "; "
+            "$r = @(foreach ($n in $o) { $s = Get-Service -Name $n -ErrorAction SilentlyContinue; "
+            "if (-not $s) { [ordered]@{ Nombre = $n; Resultado = 'no existe' }; continue }; "
+            "if ($s.Status -eq 'Running') { [ordered]@{ Nombre = $n; Resultado = 'ya' }; continue }; "
+            "try { Start-Service -Name $n -ErrorAction Stop; [ordered]@{ Nombre = $n; Resultado = 'iniciado' } } "
+            "catch { [ordered]@{ Nombre = $n; Resultado = 'error'; Error = $_.Exception.Message } } }); "
+            "'" + MARCA_JSON + "' + (ConvertTo-Json -InputObject $r -Compress)")
 
 
 # Tipos de instalador: winget no puede pasar un programa de MSIX (Store) a MSI/EXE ni al revés.
@@ -6251,6 +6414,84 @@ TIPOS_REINTENTABLES = ("error", "cancelado", "omitido")
 CODIGOS_PROGRAMA_ABIERTO = (0x8A150101, 0x8A150103, 0x8A150111)
 
 
+class DialogoProgramaAbierto(QDialog):
+    """
+    «Este programa está en uso»: quién lo usa y qué hacer antes de instalarlo. Antes era un QMessageBox:
+    sus cuatro botones largos salían cortados y, si solo lo usaban sus servicios, no ofrecía finalizarlos.
+    respuesta: revisar | finalizar | seguir | omitir.
+    """
+
+    def __init__(self, parent, nombre: str, carpeta: str, finalizables: list, intocables: list, es_admin: bool):
+        super().__init__(parent)
+        self.respuesta = "omitir"           # cerrar la ventana es saltar este programa
+        self.setWindowTitle(APP_NOMBRE)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(SPACING_LG, SPACING_LG, SPACING_LG, SPACING_LG)
+        v.setSpacing(SPACING_SM)
+        t = QLabel(f"«{nombre}» está en uso")
+        t.setProperty("class", "titulo-pagina")
+        t.setWordWrap(True)
+        v.addWidget(t)
+        v.addWidget(etiqueta("Si sigue abierto, el instalador puede fallar («otra aplicación lo está usando») o "
+                             "dejar la actualización a medias.", "suave"))
+
+        def renglones(procesos: list, notas: dict | None = None) -> str:
+            return "\n".join(f"•  {n}" + (f" ({c} procesos)" if c > 1 else "") + (f" — usa {a}" if a else "")
+                             + (f" — {notas[n]}" if notas and notas.get(n) else "")
+                             for n, c, a in agrupar_procesos(procesos)[:8])
+        programas = [x for x in finalizables if x.get("Sesion") != 0]
+        servicios = [x for x in finalizables if x.get("Sesion") == 0]
+        motivos = {(x.get("Descripcion") or x.get("Nombre") or "?").strip(): motivo_intocable(x) for x in intocables}
+        for titulo, procesos, notas in (("PROGRAMAS ABIERTOS", programas, None), ("SUS SERVICIOS", servicios, None),
+                                        ("NO SE TOCAN", intocables, motivos)):
+            if procesos:
+                v.addSpacing(SPACING_XS)
+                v.addWidget(etiqueta(titulo))
+                lista = QLabel(renglones(procesos, notas))
+                lista.setWordWrap(True)
+                lista.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                v.addWidget(lista)
+
+        v.addSpacing(SPACING_XS)
+        if finalizables:
+            que = ([] if not programas else ["a los programas se les pide cerrarse y, si siguen abiertos a los 10 s, "
+                                             "se finalizan (pierdes lo que no hayas guardado en ellos)"]) \
+                + ([] if not servicios else ["los servicios se detienen y, al terminar la instalación, se vuelven a "
+                                             "iniciar"])
+            v.addWidget(etiqueta("«Finalizarlos y seguir»: " + "; ".join(que) + ".", "suave"))
+        else:
+            v.addWidget(etiqueta("Ninguno se puede finalizar desde aquí. El instalador suele reemplazar esos archivos "
+                                 "o pedir que reinicies: «Actualizar de todos modos» lo intenta.", "suave"))
+        nota = f"Carpeta revisada: {carpeta}"
+        if not es_admin:
+            nota += ("\nSin permisos de administrador no se ven ni se pueden finalizar los programas y servicios que "
+                     "corren como administrador.")
+        v.addWidget(etiqueta(nota, "suave"))
+
+        v.addSpacing(SPACING_SM)
+        fila = QHBoxLayout()
+        fila.setSpacing(SPACING_SM)
+        botones = [("Saltar este programa", "fantasma", "omitir"), (None, None, None),
+                   ("Actualizar de todos modos", None, "seguir"),
+                   ("Ya los cerré: revisar otra vez", None, "revisar")]
+        if finalizables:
+            botones.append(("Finalizarlos y seguir", "peligro", "finalizar"))
+        for texto, clase, respuesta in botones:
+            if texto is None:
+                fila.addStretch(1)
+                continue
+            b = boton(texto, clase)
+            b.clicked.connect(lambda _=False, r=respuesta: self._responder(r))
+            if respuesta == "revisar":
+                b.setDefault(True)
+            fila.addWidget(b)
+        v.addLayout(fila)
+
+    def _responder(self, respuesta: str):
+        self.respuesta = respuesta
+        self.accept()
+
+
 class DialogoReporte(QDialog):
     """Reporte al terminar de actualizar: cifras de lo que salió bien o mal y el detalle de cada programa."""
 
@@ -6698,6 +6939,7 @@ class PaginaActualizar(QWidget):
         self._carril = CarrilFondo(self)
         self._carril.al_avance = self._avance_fondo
         self._preparados: dict[str, dict] = {}      # clave → {"verifico": bool, "ok": bool}
+        self._servicios_detenidos: list[str] = []   # para instalar; se vuelven a iniciar al acabar el paquete
         self._fondo_en: str | None = None           # el que se está preparando ahora
         self._indice_instalando = -1                # su posición en el lote
         self._siguiendo_fondo = False               # la barra muestra la preparación (se espera a que acabe)
@@ -7601,6 +7843,7 @@ class PaginaActualizar(QWidget):
     def _terminar_flujo(self):
         self._flujo = None
         self._en_curso = None
+        self._reiniciar_servicios_al_salir()
         self._parar_preparacion()
         self._reloj_fase.stop()
         self._fase, self._prefijo = None, ""
@@ -8025,7 +8268,10 @@ class PaginaActualizar(QWidget):
         self._preparados, self._fondo_en, self._indice_instalando = {}, None, -1
         if opciones["preparar_en_paralelo"] and total > 1:
             self._carril.iniciar(self._flujo_preparar(claves, opciones))
+        prefijo = ""
         for i, clave in enumerate(claves, 1):
+            # Los servicios que se detuvieron para el paquete anterior vuelven a iniciarse (también si se omitió)
+            yield from self._reiniciar_servicios(prefijo)
             p = self._paquetes[clave]
             fila = reporte["filas"][clave]
             self._indice_instalando = i - 1
@@ -8206,6 +8452,7 @@ class PaginaActualizar(QWidget):
                     self.consola.agregar("Se detiene: falló una actualización y la opción lo pide.", "aviso")
             if self._abortado:
                 break
+        yield from self._reiniciar_servicios(prefijo)
         self._parar_preparacion()
         for clave in claves:
             fila = reporte["filas"][clave]
@@ -8403,13 +8650,14 @@ class PaginaActualizar(QWidget):
             archivos = sorted({a for _, _, a in grupos if a})
             self.consola.agregar(f"⚠ {p['nombre']} está en uso por: {p['abierto_por']}"
                                  + (f" (tienen abierto {', '.join(archivos[:3])})" if archivos else "") + ".", "aviso")
-            finalizables, intocables = separar_finalizables(datos)
+            finalizables, intocables = separar_finalizables(datos, carpeta)
             if auto and finalizables and not finalizo:
                 respuesta = "finalizar"
             elif auto or self.sin_dialogos:
                 if intocables:
-                    self.consola.agregar("No se finalizan (son de Windows o servicios; el instalador se encarga): "
-                                         + ", ".join(n for n, _, _ in agrupar_procesos(intocables)) + ".", "suave")
+                    self.consola.agregar("No se finalizan (son de Windows o de otro programa; el instalador se "
+                                         "encarga): " + ", ".join(n for n, _, _ in agrupar_procesos(intocables)) + ".",
+                                         "suave")
                 return "seguir"
             else:
                 respuesta = self._preguntar_abiertos(p, carpeta, finalizables, intocables)
@@ -8424,9 +8672,11 @@ class PaginaActualizar(QWidget):
 
     def _finalizar_procesos(self, p: dict, procesos: list, prefijo: str):
         """Cierra (o finaliza) los procesos que tienen abierto el programa y dice cuáles no se pudo."""
-        nombres = ", ".join(n for n, _, _ in agrupar_procesos(procesos))
-        self.consola.agregar(f"⏹ {p['nombre']}: se cierran {nombres} (si no se cierran solos en 10 s, se "
-                             "finalizan)…", "aviso")
+        programas = ", ".join(n for n, _, _ in agrupar_procesos([x for x in procesos if x.get("Sesion") != 0]))
+        servicios = ", ".join(n for n, _, _ in agrupar_procesos([x for x in procesos if x.get("Sesion") == 0]))
+        partes = ([f"se cierran {programas} (si no se cierran solos en 10 s, se finalizan)"] if programas else []) \
+            + ([f"se detienen sus servicios ({servicios}; al terminar se vuelven a iniciar)"] if servicios else [])
+        self.consola.agregar(f"⏹ {p['nombre']}: " + " y ".join(partes) + "…", "aviso")
         self._empezar_paso(prefijo, "Cerrando los programas que lo tienen abierto…")
         r = yield self._powershell(script_finalizar_procesos(procesos), 120)
         if r.abortado:
@@ -8436,6 +8686,7 @@ class PaginaActualizar(QWidget):
             self.consola.agregar("No se pudieron cerrar (PowerShell no respondió).", "aviso")
             return
         cerrados, fallos = resumir_finalizados(datos)
+        self._servicios_detenidos += [n for n in servicios_detenidos(datos) if n not in self._servicios_detenidos]
         if cerrados:
             self.consola.agregar("✓ Se cerraron: " + ", ".join(cerrados) + ".", "ok")
             p.setdefault("finalizados", []).extend(cerrados)
@@ -8445,36 +8696,46 @@ class PaginaActualizar(QWidget):
                                                              "los que corren como administrador") + ".", "aviso")
 
     def _preguntar_abiertos(self, p: dict, carpeta: str, finalizables: list, intocables: list) -> str:
-        caja = QMessageBox(self)
-        caja.setIcon(QMessageBox.Icon.Warning)
-        caja.setWindowTitle(APP_NOMBRE)
+        dialogo = DialogoProgramaAbierto(self, p["nombre"], carpeta, finalizables, intocables, self.es_admin)
+        dialogo.exec()
+        return dialogo.respuesta
 
-        def lineas(procesos: list, nota: str = "") -> list[str]:
-            return [f"• {n}" + (f" ({c} procesos)" if c > 1 else "") + (f" — usa {a}" if a else "") + nota
-                    for n, c, a in agrupar_procesos(procesos)]
-        lista = (lineas(finalizables) + lineas(intocables, " (de Windows: no se cierra)"))[:12]
-        caja.setText(f"«{p['nombre']}» está en uso ahora mismo por:\n\n" + "\n".join(lista) + "\n\nSi siguen "
-                     "abiertos, el instalador puede fallar («otra aplicación lo está usando») o dejar la actualización "
-                     "a medias.\n\nCiérralos tú (guarda antes lo que tengas abierto) y pulsa «Ya los cerré», o deja "
-                     "que la app los cierre.")
-        caja.setInformativeText(
-            ("«Finalizarlos y seguir»: se les pide cerrarse y, si siguen abiertos a los 10 s, se finalizan: "
-             "pierdes lo que no hayas guardado en ellos.\n" if finalizables else "")
-            + f"Carpeta revisada: {carpeta}"
-            + ("" if self.es_admin else "\nSin permisos de administrador no se ven ni se pueden finalizar los "
-                                        "programas que corren como administrador."))
-        b_revisar = caja.addButton("Ya los cerré: revisar otra vez", QMessageBox.ButtonRole.AcceptRole)
-        b_finalizar = (caja.addButton("Finalizarlos y seguir", QMessageBox.ButtonRole.DestructiveRole)
-                       if finalizables else None)
-        b_seguir = caja.addButton("Actualizar de todos modos", QMessageBox.ButtonRole.ActionRole)
-        caja.addButton("Saltar este programa", QMessageBox.ButtonRole.RejectRole)
-        caja.setDefaultButton(b_revisar)
-        caja.exec()
-        if caja.clickedButton() is b_revisar:
-            return "revisar"
-        if b_finalizar is not None and caja.clickedButton() is b_finalizar:
-            return "finalizar"
-        return "seguir" if caja.clickedButton() is b_seguir else "omitir"
+    def _reiniciar_servicios(self, prefijo: str):
+        """Vuelve a iniciar los servicios que se detuvieron para instalar (si el instalador no lo hizo ya)."""
+        nombres, self._servicios_detenidos = self._servicios_detenidos, []
+        if not nombres:
+            return
+        self._empezar_paso(prefijo, "Volviendo a iniciar los servicios que se detuvieron…")
+        r = yield self._powershell(script_iniciar_servicios(nombres), 90)
+        datos = r.datos if isinstance(r.datos, list) else [r.datos] if isinstance(r.datos, dict) else []
+        hechos = {x.get("Nombre"): x for x in datos if isinstance(x, dict)}
+        iniciados = [n for n in nombres if (hechos.get(n) or {}).get("Resultado") == "iniciado"]
+        ya = [n for n in nombres if (hechos.get(n) or {}).get("Resultado") in ("ya", "no existe")]
+        fallos = [n + (f": {hechos[n]['Error']}" if (hechos.get(n) or {}).get("Error") else "")
+                  for n in nombres if n not in iniciados and n not in ya]
+        if iniciados:
+            self.consola.agregar("▶ Se volvieron a iniciar los servicios: " + ", ".join(iniciados) + ".", "ok")
+        if ya:
+            self.consola.agregar("Los servicios ya estaban en marcha (los inició el instalador): " + ", ".join(ya)
+                                 + ".", "suave")
+        if fallos:
+            self.consola.agregar("⚠ No se pudieron volver a iniciar (se inician al reiniciar Windows, o desde "
+                                 "services.msc): " + "; ".join(fallos) + ".", "aviso")
+
+    def _reiniciar_servicios_al_salir(self):
+        """Si el flujo se cortó sin volver a iniciarlos (error o cierre), se inician sin esperar."""
+        nombres, self._servicios_detenidos = self._servicios_detenidos, []
+        if not nombres:
+            return
+        programa, args = comando_powershell(script_iniciar_servicios(nombres))
+        try:
+            subprocess.Popen([programa] + args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, creationflags=FLAGS_SIN_VENTANA, env=entorno_powershell())
+            self.consola.agregar("Se vuelven a iniciar los servicios que se detuvieron: " + ", ".join(nombres) + ".",
+                                 "suave")
+        except OSError as e:
+            self.consola.agregar(f"⚠ No se pudieron volver a iniciar {', '.join(nombres)}: {e}. Se inician al "
+                                 "reiniciar Windows.", "aviso")
 
     def _al_terminar_actualizacion(self):
         if self._reporte:
@@ -10531,6 +10792,59 @@ def autoprueba(app: QApplication, ventana: VentanaPrincipal) -> int:
         if ES_WINDOWS:
             probar("copiar_mir", copiar_mir)
 
+        # 1c. Carpeta omitida con una ruta dentro del origen: antes /XD no omitía nada con ella
+        def copiar_omitir_ruta():
+            p = pag["Copiar"]
+            fuente = tmp / "origen_rutas"
+            for ruta in (r"z OLD\V2.1 FINAL\TOOLS", r"z OLD\V2.1 FINAL\otra", r"otro\TOOLS"):
+                (fuente / ruta).mkdir(parents=True)
+                (fuente / ruta / "x.txt").write_bytes(b"x")
+            destino = tmp / "destino_rutas"
+            antes = p.lista_carpetas.valores()
+            p.sin_dialogos = True
+            p.origen.establecer(str(fuente))
+            p.destino.establecer(str(destino))
+            p.chk_carpeta.setChecked(False)
+            p.chk_simular.setChecked(False)
+            p.lista_carpetas.establecer(antes + [[r"z OLD\V2.1 FINAL\TOOLS", True]])
+            try:
+                comando = p._comando_texto(p.argumentos())
+                p.iniciar()
+                terminado = esperar(p, 120)
+            finally:
+                p.lista_carpetas.establecer(antes)
+            casos = {r"build*": r"build*", r"C:\x\y": r"C:\x\y", r"\\srv\c\d": r"\\srv\c\d",
+                     r"\a\b": ntpath.join(str(fuente), r"a\b"), "a/b": ntpath.join(str(fuente), r"a\b")}
+            mal = {c: completar_carpeta_omitida(c, str(fuente)) for c, esperado in casos.items()
+                   if completar_carpeta_omitida(c, str(fuente)) != esperado}
+            registrar("copiar_omitir_ruta", terminado and p.salio_bien and not mal
+                      and not (destino / r"z OLD\V2.1 FINAL\TOOLS").exists()
+                      and (destino / r"z OLD\V2.1 FINAL\otra\x.txt").exists() and (destino / r"otro\TOOLS\x.txt").exists(),
+                      comando=comando.replace(str(tmp), "<tmp>"), completar_mal=mal)
+        if ES_WINDOWS:
+            probar("copiar_omitir_ruta", copiar_omitir_ruta)
+
+        # 1d. El avance con /MT: robocopy nombra cada archivo al EMPEZARLO, así que el % sale de los bytes que
+        # escribió de verdad (contador de E/S de Windows), no de sus líneas
+        def avance_multihilo():
+            fuente, destino = tmp / "origen_avance", tmp / "destino_avance"
+            fuente.mkdir()
+            (fuente / "grande.bin").write_bytes(os.urandom(24 << 20))
+            proc = subprocess.Popen(["robocopy", str(fuente), str(destino), "/E", "/MT:4", "/BYTES", "/R:0", "/W:0"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=FLAGS_SIN_VENTANA)
+            contador = ContadorEscrituras(proc.pid)
+            salida = proc.communicate(timeout=120)[0]
+            escritos = contador.escritos()
+            contador.cerrar()
+            datos = (escritos or 0) - len(salida)
+            pr = ProgresoRobocopy(sin_cabecera=True)
+            pr.alimentar("\t    Nuevo arch\t\t  100\tC:\\a\\uno.txt\n\t    Nuevo arch\t\t  300\tC:\\a\\dos.txt\n")
+            registrar("copiar_avance_mt", datos == 24 << 20 and pr.hechos_escritos(150) == (150, 1)
+                      and pr.hechos_escritos(400) == (400, 2) and pr.hechos() == (100, 1),
+                      bytes_escritos=escritos, datos=datos, esperado=24 << 20)
+        if ES_WINDOWS:
+            probar("copiar_avance_mt", avance_multihilo)
+
         # 2. Listar rutas
         def rutas():
             p = pag["Listar rutas"]
@@ -10734,6 +11048,76 @@ def autoprueba(app: QApplication, ventana: VentanaPrincipal) -> int:
                       respuesta=resultado.get("respuesta"), finalizados=falso.get("finalizados"), sigue_abierto=vivo)
         if ES_WINDOWS:
             probar("actualizaciones_finalizar", finalizar_abiertos)
+
+        # 6c-bis. Servicios del programa (como los de Logitech G HUB): se ofrecen para detener y luego se
+        # vuelven a iniciar. Sin tocar ningún servicio real: un ping.exe propio hace de «servicio» (sesión 0
+        # falsa) y el que se intenta iniciar no existe.
+        def servicios_programa():
+            pa = pag["Actualizaciones"]
+            fallos = []
+            carpeta = r"C:\Program Files\Programa X"
+            procesos = [
+                {"Nombre": "x_ui", "Id": 11, "Sesion": 1, "Ruta": carpeta + r"\x_ui.exe"},
+                {"Nombre": "x_servicio", "Id": 12, "Sesion": 0, "Ruta": carpeta + r"\bin\x_servicio.exe"},
+                {"Nombre": "otro_servicio", "Id": 13, "Sesion": 0, "Ruta": r"C:\Program Files\Otro\s.exe"},
+                {"Nombre": "spoolsv", "Id": 14, "Sesion": 0, "Ruta": r"C:\Windows\System32\spoolsv.exe"},
+                {"Nombre": "sin_ruta", "Id": 15, "Sesion": 0},
+                {"Nombre": "explorer", "Id": 16, "Sesion": 1, "Ruta": r"C:\Windows\explorer.exe"}]
+            si, no = separar_finalizables(procesos, carpeta)
+            if [x["Id"] for x in si] != [11, 12] or [motivo_intocable(x) for x in no] != [
+                    "servicio de otro programa", "de Windows", "servicio del sistema", "de Windows"]:
+                fallos.append(f"separar: {[x['Id'] for x in si]} / {[motivo_intocable(x) for x in no]}")
+            if servicios_detenidos([{"Resultado": "detenido", "Servicio": "a, b"}, {"Resultado": "error", "Servicio": "c"},
+                                    {"Resultado": "cerrado"}]) != ["a", "b"]:
+                fallos.append("servicios_detenidos")
+            # La ventana: con solo servicios del programa ya sale «Finalizarlos y seguir» y ningún botón se corta
+            d = DialogoProgramaAbierto(pa, "Programa X", carpeta, si[1:], no, True)
+            d.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+            d.show()
+            QApplication.processEvents()
+            botones = {b.text(): b.width() >= b.sizeHint().width() for b in d.findChildren(QPushButton)}
+            d.close()
+            if "Finalizarlos y seguir" not in botones or not all(botones.values()):
+                fallos.append(f"ventana: {botones}")
+            # Los scripts de PowerShell de verdad
+            exe = tmp / "programa servicio" / "servicio_prueba.exe"
+            exe.parent.mkdir()
+            shutil.copy(Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "PING.EXE", exe)
+            proc = subprocess.Popen([str(exe), "-n", "120", "127.0.0.1"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=FLAGS_SIN_VENTANA)
+            try:
+                time.sleep(0.3)
+                programa, args = comando_powershell(script_finalizar_procesos(
+                    [{"Id": proc.pid, "Nombre": exe.stem, "Sesion": 0}], espera=2))
+                r = subprocess.run([programa] + args, capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=90, creationflags=FLAGS_SIN_VENTANA,
+                                   env=entorno_powershell())
+                fin = json.loads(next((l[len(MARCA_JSON):] for l in r.stdout.splitlines() if l.startswith(MARCA_JSON)),
+                                      "null"))
+                programa, args = comando_powershell(script_iniciar_servicios(["UtilidadesPrueba_NoExiste_7f3"]))
+                r = subprocess.run([programa] + args, capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=90, creationflags=FLAGS_SIN_VENTANA,
+                                   env=entorno_powershell())
+                inicio = json.loads(next((l[len(MARCA_JSON):] for l in r.stdout.splitlines()
+                                          if l.startswith(MARCA_JSON)), "null"))
+                for _ in range(30):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                vivo = proc.poll() is None
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+            fin = fin if isinstance(fin, list) else [fin]
+            inicio = inicio if isinstance(inicio, list) else [inicio]
+            if vivo or (fin[0] or {}).get("Resultado") != "finalizado":
+                fallos.append(f"finalizar servicio: {fin}, sigue vivo: {vivo}")
+            if (inicio[0] or {}).get("Resultado") != "no existe":
+                fallos.append(f"iniciar servicios: {inicio}")
+            registrar("actualizaciones_servicios", not fallos, fallos=fallos)
+        if ES_WINDOWS:
+            probar("actualizaciones_servicios", servicios_programa)
 
         # 6d. Preparación en paralelo: el segundo carril (hilo, pausa y PowerShell) y dejar una descarga
         # donde winget la reutiliza (una carpeta propia en %TEMP%\WinGet, que se borra al final)
