@@ -35,7 +35,8 @@ Pestañas:
     5. Licencias         THIRD_PARTY_NOTICES.txt con las licencias de un venv o del Python global.
     6. Actualizaciones   winget upgrade: revisa que winget y sus orígenes sean los oficiales,
                          verifica SHA256 y firma (PowerShell), actualiza uno por uno y hace un reporte.
-    7. Acerca de         Versión, creador, licencia y datos de la app.
+    7. Acerca de         Versión, creador, licencia y datos de la app. Busca versiones nuevas en GitHub
+                         y la actualiza (descarga comprobada + instalador de Inno Setup en silencio).
 
 La configuración (tema, sesiones guardadas, último venv...) y los registros viven en
 %LOCALAPPDATA%\\DEUS MACHINA\\UtilidadesArchivos (utilidades_config.json y registros\\), igual con el
@@ -81,13 +82,13 @@ from PyQt6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QApplicatio
                              QPlainTextEdit, QProgressBar, QPushButton,
                              QRadioButton, QScrollArea, QSizePolicy, QSpinBox,
                              QSplitter, QTableWidget, QTableWidgetItem,
-                             QTabWidget, QVBoxLayout, QWidget)
+                             QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
 
 # Datos de la app: los scripts de compilación los leen de aquí (sin importar PyQt6)
 APP_NOMBRE = "Utilidades de archivos"
 APP_ID = "UtilidadesArchivos"            # nombre del .exe y de su carpeta de datos
 APP_EDITOR = "DEUS MACHINA"              # carpeta del editor en %LOCALAPPDATA%: los datos van en <editor>\<APP_ID>
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_AUTOR = "DoMiNaTh0R"
 APP_AUTOR_NOMBRE = "Kevin González"
 APP_ANIO = "2026"
@@ -328,6 +329,7 @@ COLOR_LOG = {
     "error": "#e5484d",
     "titulo": "#4c7dff",
     "suave": "#8a90a2",
+    "destaca": "#9b6dff",       # el resultado que más importa (ej. cómo queda el destino)
 }
 
 
@@ -738,6 +740,23 @@ QLabel[class="seccion"] {{
     font-weight: 600;
     padding-top: {SPACING_XS}px;
 }}
+
+/* ─── Versión nueva de la app ────────────────────── */
+QFrame#avisoApp {{
+    background-color: {p['primario_suave']};
+    border: none;
+    border-bottom: 1px solid {p['borde']};
+}}
+QFrame#avisoApp QLabel {{ color: {p['texto_primario_suave']}; font-weight: 600; }}
+QFrame#avisoApp[tipo="ok"] {{ background-color: rgba(46, 157, 91, 0.16); }}
+QFrame#avisoApp[tipo="aviso"] {{ background-color: rgba(208, 135, 0, 0.16); }}
+QFrame#avisoApp[tipo="ok"] QLabel, QFrame#avisoApp[tipo="aviso"] QLabel {{ color: {p['texto']}; }}
+QTextBrowser#notasRelease {{
+    background-color: {p['superficie']};
+    border: 1px solid {p['borde']};
+    border-radius: {RADIUS_DEFAULT}px;
+    padding: {SPACING_SM}px;
+}}
 """
 
 
@@ -880,6 +899,16 @@ def entorno_limpio() -> dict:
     return env
 
 
+def entorno_powershell() -> dict | None:
+    """
+    Si la app se abrió desde PowerShell 7, hereda su PSModulePath y Windows PowerShell 5.1 no puede cargar
+    Get-AuthenticodeSignature: sin ella, usa sus módulos de siempre. None = el entorno de la app tal cual.
+    """
+    if "PSModulePath" not in os.environ:
+        return None
+    return {k: v for k, v in os.environ.items() if k.lower() != "psmodulepath"}
+
+
 FLAGS_SIN_VENTANA = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -887,10 +916,10 @@ class Cancelado(Exception):
     pass
 
 
-def ejecutar_cancelable(tarea, cmd, timeout=600) -> subprocess.CompletedProcess:
+def ejecutar_cancelable(tarea, cmd, timeout=600, env: dict | None = None) -> subprocess.CompletedProcess:
     """subprocess.run que se puede cancelar desde la interfaz."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            stdin=subprocess.DEVNULL, env=entorno_limpio(),
+                            stdin=subprocess.DEVNULL, env=env or entorno_limpio(),
                             creationflags=FLAGS_SIN_VENTANA)
     inicio = time.monotonic()
     while True:
@@ -1574,13 +1603,20 @@ class BarraSesiones(QFrame):
     Combo de sesiones con nombre para una pestaña. 'Predeterminada' siempre existe
     y no se puede sobrescribir. Los cambios sin guardar se marcan, pero se pueden
     usar igual sin guardarlos.
+    «Sin guardar» se decide comparando con lo que había al cargar o guardar la sesión, no
+    con cada señal: así no se marca por cambios automáticos (ej. los hilos según el disco)
+    y se desmarca si deshaces el cambio.
+    comparable(estado) quita lo que no cuenta como cambio (ej. los hilos si van en automático).
     """
     sesion_cargada = pyqtSignal(dict)
 
-    def __init__(self, config: Config, clave: str, defaults: dict, obtener_estado, parent=None):
+    def __init__(self, config: Config, clave: str, defaults: dict, obtener_estado, parent=None, comparable=None):
         super().__init__(parent)
         self.config, self.clave, self.defaults = config, clave, defaults
         self.obtener_estado = obtener_estado
+        self.comparable = comparable or (lambda estado: estado)
+        self._referencia: dict | None = None     # el estado de la sesión elegida (None = no coincide con ninguna)
+        self._mod = False
         self._cargando = False
         self.setProperty("class", "card")
 
@@ -1640,7 +1676,19 @@ class BarraSesiones(QFrame):
         self.btn_guardar.setEnabled(not es_pred)
 
     def _set_mod(self, valor: bool):
+        self._mod = valor
         self.lbl_mod.setVisible(valor)
+
+    def _estado_comparable(self) -> dict:
+        return self.comparable(copy.deepcopy(self.obtener_estado()))
+
+    def _tomar_referencia(self):
+        """Lo que hay en pantalla pasa a ser «guardado»."""
+        self._referencia = self._estado_comparable()
+        self._set_mod(False)
+
+    def modificado(self) -> bool:
+        return self._mod
 
     # ─── acciones ───
     def cargar_inicial(self):
@@ -1666,12 +1714,13 @@ class BarraSesiones(QFrame):
             self.sesion_cargada.emit(estado)
         finally:
             self._cargando = False
-        self._set_mod(False)
+        self._tomar_referencia()
         self._actualizar_botones()
 
     def marcar_modificado(self):
+        """Avisa de un posible cambio: se marca solo si de verdad difiere de la sesión elegida."""
         if not self._cargando:
-            self._set_mod(True)
+            self._set_mod(self._referencia is None or self._estado_comparable() != self._referencia)
 
     def guardar(self):
         nombre = self.combo.currentText()
@@ -1680,7 +1729,7 @@ class BarraSesiones(QFrame):
             return
         self._sesiones()[nombre] = self.obtener_estado()
         self.config.guardar()
-        self._set_mod(False)
+        self._tomar_referencia()
 
     def guardar_como(self):
         sugerido = self.combo.currentText() if self.combo.currentText() != PREDETERMINADA else ""
@@ -1699,7 +1748,7 @@ class BarraSesiones(QFrame):
         self._sec()["ultima"] = nombre
         self.config.guardar()
         self._rellenar(nombre)
-        self._set_mod(False)
+        self._tomar_referencia()
 
     def eliminar(self):
         nombre = self.combo.currentText()
@@ -1713,6 +1762,7 @@ class BarraSesiones(QFrame):
         self.config.guardar()
         # Se conservan los valores en pantalla; solo cambia la sesión seleccionada
         self._rellenar(PREDETERMINADA)
+        self._referencia = None
         self._set_mod(True)
 
 
@@ -1902,6 +1952,14 @@ class Consola(QPlainTextEdit):
             self._pendiente.append(("raw", texto))
             self._programar()
 
+    def agregar_lineas(self, lineas: list[list[tuple[str, str]]], titulo: str = ""):
+        """
+        Varias líneas con partes de distinto color (ej. una tabla): [[(texto, tipo), …], …]. La hora (y el
+        título) van en su propio renglón y las líneas debajo, pegadas a la izquierda.
+        """
+        self._pendiente.append(("lineas", lineas, time.strftime("%H:%M:%S"), titulo))
+        self._programar()
+
     def cerrar_linea(self):
         self._pendiente.append(("fin",))
         self._programar()
@@ -1930,7 +1988,7 @@ class Consola(QPlainTextEdit):
             color = COLOR_LOG.get(tipo)
             if color:
                 f.setForeground(QColor(color))
-            if tipo == "titulo":
+            if tipo in ("titulo", "destaca"):
                 f.setFontWeight(QFont.Weight.Bold)
             self._formatos[tipo] = f
         return f
@@ -1979,6 +2037,15 @@ class Consola(QPlainTextEdit):
             c.insertText(linea, self._formato(tipo))
             c.insertText("\n", QTextCharFormat())
 
+    def _escribir_lineas(self, c: QTextCursor, lineas: list, hora: str, titulo: str = ""):
+        c.movePosition(QTextCursor.MoveOperation.End)
+        c.insertText(f"[{hora}]" + (" " if titulo else ""), self._formato("suave"))
+        c.insertText(titulo + "\n", self._formato("titulo"))
+        for partes in lineas:
+            for texto, tipo in partes:
+                c.insertText(texto, self._formato(tipo))
+            c.insertText("\n", QTextCharFormat())
+
     def _vaciar(self):
         items, self._pendiente = self._pendiente, []
         if not items:
@@ -2012,6 +2079,8 @@ class Consola(QPlainTextEdit):
                 terminadas = []
             if item[0] == "msg":
                 self._escribir_msg(c, item[1], item[2], item[3])
+            elif item[0] == "lineas":
+                self._escribir_lineas(c, item[1], item[2], item[3])
         self._escribir_crudo(c, terminadas)
         c.endEditBlock()
         if abajo:
@@ -2418,21 +2487,24 @@ def describir_codigo_robocopy(codigo: int, borra: str | None = None, simulado: b
     if codigo == 0:
         partes.append("No había nada que copiar: el destino ya estaba al día.")
     if codigo & 1:
-        partes.append("Se copiaron archivos correctamente.")
+        partes.append("Hay archivos que copiar (es una simulación: no se copió nada)." if simulado
+                      else "Se copiaron archivos correctamente.")
     if codigo & 2:
         if borra and simulado:
-            partes.append(f"Hay archivos o carpetas extra en el destino: con {borra} se borrarían.")
+            partes.append(f"Hay cosas que solo están en el destino: con {borra} se borrarían.")
         elif borra and borrados == 0:
-            partes.append(f"Hay elementos extra en el destino que {borra} no borró (por ejemplo, carpetas "
+            partes.append(f"Hay cosas que solo están en el destino y {borra} no borró (por ejemplo, carpetas "
                           "omitidas con /XD).")
         elif borra:
-            partes.append(f"Se BORRARON del destino los archivos y carpetas extra (ya no estaban en el origen; {borra}).")
+            partes.append(f"Se BORRÓ del destino lo que ya no estaba en el origen ({borra}).")
         else:
-            partes.append("Hay archivos o carpetas extra en el destino (no se tocaron).")
+            partes.append("Hay cosas que solo están en el destino: " + ("no se tocarían." if simulado
+                                                                        else "no se tocaron."))
     if codigo & 4:
         partes.append("Se detectaron archivos no coincidentes.")
     if codigo & 8:
-        partes.append("Algunos archivos o carpetas NO se pudieron copiar (revisa el registro).")
+        partes.append("Algunos archivos o carpetas NO se " + ("podrían" if simulado else "pudieron")
+                      + " copiar (revisa el registro).")
     tipo = "error" if codigo & 8 else ("aviso" if codigo & 4 else "ok")
     return tipo, f"Código {codigo}: " + " ".join(partes)
 
@@ -2462,6 +2534,201 @@ def leer_resumen_robocopy(texto: str) -> dict | None:
     bytes_ = filas[2] if len(filas) >= 3 else None
     return {"archivos": archivos[1], "bytes": bytes_[1] if bytes_ else None, "omitidos": archivos[2],
             "archivos_extra": archivos[5], "carpetas_extra": carpetas[5], "bytes_extra": bytes_[5] if bytes_ else None}
+
+
+# La tabla completa del final, para explicarla: filas Carpetas, Archivos y Bytes con 6 columnas.
+# Sin /BYTES, los bytes vienen como «29.371 g» (k, m, g y t de 1024).
+RE_FILA_TABLA = re.compile(r"^\s*[^\d\s][^:]{0,20}:\s+(.+?)\s*$")
+COLUMNAS_ROBOCOPY = ("total", "copiado", "omitido", "no_coincide", "error", "extras")
+UNIDADES_ROBOCOPY = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
+
+
+def _valores_fila_robocopy(resto: str) -> list[float] | None:
+    valores: list[float] = []
+    for token in resto.split():
+        unidad = UNIDADES_ROBOCOPY.get(token.lower())
+        if unidad and valores:
+            valores[-1] *= unidad
+        elif re.fullmatch(r"\d+(?:[.,]\d+)?", token):
+            valores.append(float(token.replace(",", ".")))
+        else:
+            return None
+    return valores
+
+
+def leer_tabla_robocopy(texto: str) -> dict | None:
+    """
+    {"carpetas", "archivos", "bytes"} → {total, copiado, omitido, no_coincide, error, extras}.
+    Las filas se reconocen por su forma y su orden, no por el texto (cambia con el idioma).
+    «bytes» es None si esa fila no se pudo leer.
+    """
+    filas = []
+    for linea in texto.splitlines():
+        m = RE_FILA_TABLA.match(linea)
+        valores = _valores_fila_robocopy(m.group(1)) if m else None
+        if valores is not None and len(valores) == 6:
+            filas.append(valores)
+    if len(filas) < 2:
+        return None
+    filas = filas[-3:] if len(filas) >= 3 else filas
+    return {"carpetas": dict(zip(COLUMNAS_ROBOCOPY, map(int, filas[0]))),
+            "archivos": dict(zip(COLUMNAS_ROBOCOPY, map(int, filas[1]))),
+            "bytes": dict(zip(COLUMNAS_ROBOCOPY, filas[2])) if len(filas) >= 3 else None}
+
+
+RE_DURACION_ROBOCOPY = re.compile(r"(\d+):(\d{2}):(\d{2})")
+
+
+def leer_tiempos_robocopy(texto: str) -> dict | None:
+    """
+    La fila de tiempos (Total, Copiado, ERROR, Extras) en segundos, la velocidad (bytes/s, si robocopy la
+    escribe: con /MT no) y la línea de la hora en que terminó. None si no hay fila de tiempos.
+    """
+    tiempos = None
+    velocidad = fin = None
+    for linea in texto.splitlines():
+        m = RE_FILA_TABLA.match(linea)
+        if not m:
+            continue
+        tokens = m.group(1).split()
+        if len(tokens) == 4 and all(RE_DURACION_ROBOCOPY.fullmatch(x) for x in tokens):
+            segundos = [int(h) * 3600 + int(mi) * 60 + int(s)
+                        for h, mi, s in (RE_DURACION_ROBOCOPY.fullmatch(x).groups() for x in tokens)]
+            tiempos = dict(zip(("total", "copiando", "errores", "extras"), segundos))
+            continue
+        v = re.search(r"([\d.,]+)\s*Bytes/s", m.group(1), re.I)
+        if v:
+            velocidad = int(re.sub(r"\D", "", v.group(1)) or 0) or None
+        elif re.search(r"\b(19|20)\d\d\b", m.group(1)) and re.search(r"\d:\d\d", m.group(1)):
+            fin = m.group(1).strip()
+    if tiempos is None:
+        return None
+    return dict(tiempos, velocidad=velocidad, fin=fin)
+
+
+def dibujar_tabla(cabecera: list[str], filas: list[tuple[list[str], str]],
+                  separar_antes: tuple[int, ...] = ()) -> list[list[tuple[str, str]]]:
+    """
+    Tabla con bordes para la consola (letra monoespaciada): una lista de líneas, cada una con sus
+    partes [(texto, tipo de color)]. filas: [(celdas, tipo)]; la 1.ª columna va a la izquierda.
+    separar_antes: índices de fila que llevan una raya encima.
+    """
+    anchos = [max(len(f[i]) for f in [cabecera] + [c for c, _ in filas]) for i in range(len(cabecera))]
+
+    def raya(izq: str, medio: str, der: str) -> list[tuple[str, str]]:
+        return [(izq + medio.join("─" * (a + 2) for a in anchos) + der, "suave")]
+
+    def fila(celdas: list[str], tipo: str) -> list[tuple[str, str]]:
+        partes = [("│", "suave")]
+        for i, (celda, ancho) in enumerate(zip(celdas, anchos)):
+            partes += [(" " + (celda.ljust(ancho) if i == 0 else celda.rjust(ancho)) + " ", tipo), ("│", "suave")]
+        return partes
+    lineas = [raya("┌", "┬", "┐"), fila(cabecera, "titulo"), raya("├", "┼", "┤")]
+    for i, (celdas, tipo) in enumerate(filas):
+        if i in separar_antes:
+            lineas.append(raya("├", "┼", "┤"))
+        lineas.append(fila(celdas, tipo))
+    return lineas + [raya("└", "┴", "┘")]
+
+
+def resumen_robocopy(t: dict, simulado: bool, borra: str | None, carpetas_borradas: int | None = None,
+                     hay_exclusiones: bool = False) -> tuple[list, list[tuple[str, str]]]:
+    """
+    La tabla final de robocopy, ordenada para leerla: origen (y qué se copia y qué se omite), lo que
+    solo está en el destino y CÓMO QUEDA EL DESTINO. Devuelve (líneas de la tabla, avisos [(tipo, texto)]).
+    borra: «/MIR» o «/PURGE» si se usó. carpetas_borradas: las carpetas extra que borra de verdad (las
+    excluidas con /XD que hay en el destino cuentan como «Extras», pero no se borran); None si no se sabe.
+    """
+    a, c, b = t["archivos"], t["carpetas"], t["bytes"]
+    avisos: list[tuple[str, str]] = []
+
+    def tam(col: str) -> float | None:
+        return b[col] if b is not None else None
+
+    def celdas(nombre: str, carpetas: int | None, archivos: int, tamano: float | None) -> list[str]:
+        return [nombre, "—" if carpetas is None else f"{carpetas:,}", f"{archivos:,}",
+                "?" if tamano is None else formatear_bytes(tamano)]
+
+    # Con /MT robocopy cuenta de más las carpetas copiadas (el total y las omitidas sí salen bien)
+    carpetas_copiadas = max(c["total"] - c["omitido"] - c["no_coincide"] - c["error"], 0)
+    if c["copiado"] != carpetas_copiadas:
+        avisos.append(("suave", ("Carpetas a copiar: " if simulado else "Carpetas copiadas: ")
+                       + f"{carpetas_copiadas:,} (el total menos las omitidas). Robocopy decía {c['copiado']:,}: "
+                         "con /MT (multihilo) las cuenta de más."))
+    v = "se copiaría" if simulado else "se copió"
+    filas = [(celdas("En el origen", c["total"], a["total"], tam("total")), "normal"),
+             (celdas(f"  {v} (nuevo o cambiado)", carpetas_copiadas, a["copiado"], tam("copiado")), "ok"),
+             (celdas("  " + ("se omitiría" if simulado else "se omitió") + " (ya igual o excluido)",
+                     c["omitido"], a["omitido"], tam("omitido")), "suave")]
+    if a["error"] or c["error"]:
+        filas.append((celdas("  ERROR: " + ("no se podría copiar" if simulado else "no se pudo copiar"),
+                             c["error"], a["error"], tam("error")), "error"))
+        avisos.append(("error", f"⚠ {a['error'] + c['error']:,} elemento(s) " + ("darían" if simulado else "dieron")
+                       + " ERROR aunque se reintentó (permisos, archivo en uso, ruta demasiado larga…): busca "
+                         "«ERROR» en el registro."))
+    if a["no_coincide"] or c["no_coincide"]:
+        filas.append((celdas("  archivo y carpeta con el mismo nombre", c["no_coincide"], a["no_coincide"],
+                             tam("no_coincide")), "aviso"))
+        avisos.append(("aviso", f"⚠ {a['no_coincide'] + c['no_coincide']:,} choque(s) de nombre: hay un archivo en un "
+                                "lado y una carpeta con el mismo nombre en el otro; robocopy no puede copiarlos."))
+
+    # Lo que está en el destino y no en el origen: se queda, salvo con /MIR o /PURGE
+    raya_destino = len(filas)
+    if borra:
+        carpetas_borrar = c["extras"] if carpetas_borradas is None else min(carpetas_borradas, c["extras"])
+        filas.append((celdas("Solo en el destino: " + ("se BORRARÍA" if simulado else "se BORRÓ") + f" ({borra})",
+                             carpetas_borrar, a["extras"], tam("extras")), "aviso"))
+        quedan = (c["extras"] - carpetas_borrar, 0, 0.0)
+        if quedan[0]:
+            filas.append((celdas("Solo en el destino, excluido con /XD: se queda", quedan[0], 0, None), "normal"))
+    else:
+        filas.append((celdas("Solo en el destino: " + ("se queda" if simulado else "se quedó"),
+                             c["extras"], a["extras"], tam("extras")), "normal"))
+        quedan = (c["extras"], a["extras"], tam("extras"))
+
+    # Cómo queda: lo del origen que no falló, más lo que solo estaba en el destino y no se borra
+    final_c = c["total"] - c["error"] - c["no_coincide"] + quedan[0]
+    final_a = a["total"] - a["error"] - a["no_coincide"] + quedan[1]
+    final_b = (b["total"] - b["error"] - b["no_coincide"] + (quedan[2] or 0)) if b is not None else None
+    raya_final = len(filas)
+    filas.append((celdas("CÓMO QUEDARÍA EL DESTINO" if simulado else "CÓMO QUEDÓ EL DESTINO", final_c, final_a,
+                         final_b), "destaca"))
+    cabecera = ["Simulación (no se copió nada)" if simulado else "Copia", "Carpetas", "Archivos", "Tamaño"]
+    lineas = dibujar_tabla(cabecera, filas, (raya_destino, raya_final))
+    if hay_exclusiones:
+        avisos.append(("suave", "«Cómo quedaría» es aproximado: lo que excluiste cuenta en el origen aunque no se "
+                                "copie."))
+    return lineas, avisos
+
+
+def tabla_tiempos_robocopy(tiempos: dict, simulado: bool, bytes_copiados: float | None = None,
+                           calculo: float | None = None) -> list:
+    """
+    Los tiempos de robocopy, cada uno con lo que significa, y debajo la hora en que terminó.
+    calculo: lo que tardó la pasada previa que calcula el total para el % (segundos).
+    """
+    filas = [(["Total", formatear_duracion(tiempos["total"])], "normal"),
+             (["  copiando archivos", "— (no copia)" if simulado else formatear_duracion(tiempos["copiando"])],
+              "suave"),
+             (["  reintentando lo que dio error", formatear_duracion(tiempos["errores"])],
+              "error" if tiempos["errores"] else "suave"),
+             (["  revisando lo que solo está en el destino", formatear_duracion(tiempos["extras"])], "suave")]
+    separar = []
+    if calculo:
+        separar.append(len(filas))
+        filas.append((["Antes: calcular el total (para el % y lo que falta)", formatear_duracion(calculo)], "suave"))
+    velocidad = tiempos.get("velocidad")
+    if not velocidad and bytes_copiados and tiempos["total"] >= 1:
+        velocidad = bytes_copiados / tiempos["total"]
+    if velocidad and not simulado:
+        if not separar:
+            separar.append(len(filas))
+        filas.append((["Velocidad media", f"{formatear_bytes(velocidad)}/s"], "ok"))
+    lineas = dibujar_tabla(["Tiempo de la simulación" if simulado else "Tiempo de la copia", "Duración"], filas,
+                           tuple(separar[:1]))
+    if tiempos.get("fin"):
+        lineas.append([(f"Terminó: {tiempos['fin']}", "suave")])
+    return lineas
 
 
 # «*Archivo EXTRA  1234  F:\...», «*Directorio EXTRA  -1  F:\...\» (o «*EXTRA File» en inglés):
@@ -2580,11 +2847,13 @@ class PaginaCopiar(Pagina):
         self._ruta_registro: Path | None = None
         self._borra: str | None = None          # «/MIR» o «/PURGE» si la copia borra extras del destino
         self._final_salida = ""                 # el final de la salida (para leer el resumen de robocopy)
+        self._t_calculo: float | None = None    # cuánto tardó la pasada previa (para el %)
         self._borrados: list = []               # líneas «*EXTRA» de la copia: lo que se borró de verdad
         self._linea_borrados = ""               # línea a medias entre dos lecturas
         self.sin_dialogos = False               # la autoprueba no puede esperar clics
 
-        self.sesiones = BarraSesiones(self.config, "copiar", DEFAULT_COPIAR, self.obtener_estado)
+        self.sesiones = BarraSesiones(self.config, "copiar", DEFAULT_COPIAR, self.obtener_estado,
+                                      comparable=self._estado_comparable)
         self.sesiones.sesion_cargada.connect(self.aplicar_estado)
         self.cuerpo.addWidget(self.sesiones)
 
@@ -2724,6 +2993,13 @@ class PaginaCopiar(Pagina):
             "guardar_registro": self.chk_registro.isChecked(),
             "extra": self.txt_extra.text().strip(),
         }
+
+    @staticmethod
+    def _estado_comparable(e: dict) -> dict:
+        """Con los hilos en automático, el número lo pone el disco detectado: no es un cambio tuyo."""
+        if e.get("hilos_auto"):
+            e.pop("hilos", None)
+        return e
 
     def aplicar_estado(self, e: dict):
         # Las rutas solo se cambian si la sesión trae alguna (así 'Predeterminada' no borra lo escrito)
@@ -2969,8 +3245,10 @@ class PaginaCopiar(Pagina):
             return
         self._args_copia = self.argumentos(extra_xd)
         # Con /MIR o /PURGE siempre se calcula antes (aunque no pidas el %): hay que saber qué se borraría
+        self._t_calculo = None
         if self._con_progreso() or (self._borra and not self.chk_simular.isChecked()):
             self._fase = "calculo"
+            self._t_calculo = time.monotonic()      # al acabar el cálculo pasa a ser su duración
             self._salida_calculo = []
             self.consola.agregar("Calculando cuánto hay que copiar…", "suave")
             self.estado("Calculando el tamaño de la copia…")
@@ -3057,17 +3335,33 @@ class PaginaCopiar(Pagina):
         else:
             simulado = self.chk_simular.isChecked()
             borrado = None
-            if self._borra and not simulado:
+            if self._borra:
                 self._anotar_borrados("", final=True)
                 borrado = self._cuenta_extras(leer_resumen_robocopy(self._final_salida), self._borrados)
-            n_borrados = borrado["archivos_extra"] + borrado["carpetas_extra"] if borrado else None
+            n_borrados = borrado["archivos_extra"] + borrado["carpetas_extra"] if borrado and not simulado else None
             tipo, texto = describir_codigo_robocopy(codigo, self._borra, simulado, n_borrados)
             self.consola.agregar(texto, tipo)
             self.estado("Terminado." if tipo != "error" else "Terminó con errores.")
             self.salio_bien = tipo != "error"
-            if self._borra and not simulado:
-                self._resumen_borrado(borrado)
-            self._resumen_final()
+            # La tabla de robocopy, ordenada y con cómo queda el destino (con /NJS robocopy no la escribe)
+            tabla = leer_tabla_robocopy(self._final_salida)
+            if tabla is not None:
+                lineas, avisos = resumen_robocopy(
+                    tabla, simulado, self._borra,
+                    borrado["carpetas_extra"] if borrado and self._lista_completa() else None,
+                    hay_exclusiones=bool(self.lista_carpetas.activos() or self.lista_archivos.activos()))
+                self.consola.agregar_lineas(lineas, "Resumen:")
+                for tipo_aviso, aviso in avisos:
+                    self.consola.agregar(aviso, tipo_aviso)
+                tiempos = leer_tiempos_robocopy(self._final_salida)
+                if tiempos is not None:
+                    self.consola.agregar_lineas(tabla_tiempos_robocopy(
+                        tiempos, simulado, (tabla["bytes"] or {}).get("copiado"), self._t_calculo), "Tiempos:")
+                self._resumen_final(mostrar=False)
+            else:
+                if self._borra and not simulado:
+                    self._resumen_borrado(borrado)
+                self._resumen_final()
         self._fin()
 
     @staticmethod
@@ -3092,6 +3386,7 @@ class PaginaCopiar(Pagina):
             self.consola.agregar(f"{self._borra}: no hubo nada que borrar en el destino.", "suave")
 
     def _calculo_listo(self, codigo: int):
+        self._t_calculo = time.monotonic() - self._t_calculo
         salida = "".join(self._salida_calculo)
         self._totales = leer_resumen_robocopy(salida)
         if codigo >= 16 or self._totales is None or self._totales["bytes"] is None:
@@ -3153,10 +3448,13 @@ class PaginaCopiar(Pagina):
         caja.exec()
         return caja.clickedButton() is si
 
-    def _resumen_final(self):
+    def _resumen_final(self, mostrar: bool = True):
+        """mostrar=False: solo cierra el avance (los tiempos ya salen en la tabla de tiempos)."""
         if self._progreso is None or self.chk_simular.isChecked():
             return
         self._progreso.terminar()
+        if not mostrar:
+            return
         duracion = time.monotonic() - self._t_inicio
         b, n = self._progreso.hechos()
         velocidad = f" · promedio {formatear_bytes(b / duracion)}/s" if duracion >= 1 else ""
@@ -4494,7 +4792,7 @@ ARG_REABIERTO = "--actualizaciones"
 
 def comando_de_la_app() -> tuple[str, list[str]]:
     """(programa, argumentos) para abrir otra copia de esta app, igual que se abrió esta."""
-    args = [a for a in sys.argv[1:] if a not in (ARG_REABIERTO, "--autoprueba")]
+    args = [a for a in sys.argv[1:] if a not in (ARG_REABIERTO, "--autoprueba") and not a.startswith(ARG_ACTUALIZACION)]
     if getattr(sys, "frozen", False):                  # PyInstaller (también onefile)
         return sys.executable, args
     if "__compiled__" in globals():                    # Nuitka: argv[0] es el .exe real, no el extraído
@@ -4549,7 +4847,7 @@ CODIGOS_WINGET = {
     0x8A15002D: ("error", "El instalador no pasó la comprobación de seguridad del antivirus."),
     0x8A150041: ("error", "No se aceptaron los acuerdos del paquete."),
     0x8A15005E: ("error", "El certificado del servidor no es el que se esperaba: un antivirus o un proxy está "
-                          "inspeccionando tus conexiones HTTPS (mira la tarjeta «Seguridad»)."),
+                          "inspeccionando tus conexiones HTTPS (en la tarjeta «Seguridad» puedes permitirlo)."),
     0x8A15005F: ("error", "El instalador pide la carpeta de instalación (--location) y no se pudo averiguar: "
                           "actualízalo desde el propio programa."),
     0x8A150101: ("error", "El programa está abierto: ciérralo y vuelve a intentarlo."),
@@ -4603,7 +4901,7 @@ def describir_codigo_winget(codigo: int) -> tuple[str | None, str]:
 RE_GUIONES_WINGET = re.compile(r"^\s*-{10,}\s*$")
 RE_SHA256 = re.compile(r"\b[0-9a-fA-F]{64}\b")
 RE_URL = re.compile(r"https?://[^\s\"'<>]+")
-RE_HASH_OK = re.compile(r"hash.*(verific|validat)|(verific|validat).*hash", re.I)
+RE_HASH_OK = re.compile(r"hash.*(verif|validat)|(verif|validat).*hash", re.I)    # «verificó» y «verified»
 RE_SOLO_GIRO = re.compile(r"^\s*[-\\|/]?\s*$")
 RE_TAMANOS = re.compile(r"([\d.,]+\s*[KMG]?B)\s*/\s*([\d.,]+\s*[KMG]?B)")
 # Saltos de línea y redibujos (\r suelto, o la secuencia de consola «volver a la columna 1»)
@@ -5007,7 +5305,7 @@ def script_procesos_en(carpeta: str) -> str:
             "$r = @(Get-Process | Where-Object { $_.Id -ne $yo } | ForEach-Object { $p = $_; try { "
             "$m = @($p.Modules | Where-Object { $_.FileName -and "
             "$_.FileName.StartsWith($u, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1); "
-            "if ($m.Count) { [ordered]@{ Nombre = $p.ProcessName; Id = $p.Id; "
+            "if ($m.Count) { [ordered]@{ Nombre = $p.ProcessName; Id = $p.Id; Sesion = $p.SessionId; "
             "Descripcion = $(try { $p.Description } catch { $null }); Titulo = $p.MainWindowTitle; "
             "Archivo = $m[0].ModuleName } } } catch {} }); "
             "'" + MARCA_JSON + "' + (ConvertTo-Json -InputObject $r -Compress)")
@@ -5022,6 +5320,72 @@ def agrupar_procesos(procesos: list) -> list[tuple[str, int, str]]:
         nombre = (x.get("Descripcion") or x.get("Nombre") or "?").strip()
         grupos.setdefault(nombre, []).append(x)
     return sorted(((n, len(xs), xs[0].get("Archivo") or "") for n, xs in grupos.items()), key=lambda g: (-g[1], g[0]))
+
+
+# Nunca se finalizan desde Actualizaciones: Windows los necesita, o los vuelve a abrir al momento (el
+# Explorador recarga la extensión de 7-Zip en cuanto lo usas; el instalador la reemplaza al reiniciar)
+PROCESOS_PROTEGIDOS = frozenset({
+    "system", "idle", "registry", "memory compression", "secure system", "smss", "csrss", "wininit", "winlogon",
+    "services", "lsass", "lsaiso", "svchost", "dwm", "fontdrvhost", "explorer", "sihost", "ctfmon", "taskhostw",
+    "runtimebroker", "dllhost", "conhost", "audiodg", "spoolsv", "searchhost", "searchindexer",
+    "startmenuexperiencehost", "shellexperiencehost", "textinputhost", "lockapp", "userinit", "winget",
+    "windowspackagemanagerserver", "appinstallercli", "msiexec", "trustedinstaller", "tiworker",
+    "msmpeng", "nissrv", "securityhealthservice", "securityhealthsystray", "mpdefendercoreservice",
+})
+
+
+def separar_finalizables(procesos: list) -> tuple[list[dict], list[dict]]:
+    """
+    (los que se pueden finalizar, los que no). No se tocan los de Windows (PROCESOS_PROTEGIDOS) ni los
+    servicios (sesión 0): el instalador detiene sus propios servicios.
+    """
+    si, no = [], []
+    for x in procesos or []:
+        if not isinstance(x, dict) or not x.get("Id"):
+            continue
+        protegido = (str(x.get("Nombre") or "").lower() in PROCESOS_PROTEGIDOS or x.get("Sesion") == 0
+                     or x.get("Id") == os.getpid())
+        (no if protegido else si).append(x)
+    return si, no
+
+
+def script_finalizar_procesos(procesos: list[dict], espera: int = 10) -> str:
+    """
+    Pide a cada proceso que se cierre (como pulsar la X: un navegador guarda sus pestañas) y, si sigue
+    abierto pasados `espera` segundos, lo finaliza (Stop-Process -Force). Solo toca el proceso si su Id
+    sigue siendo del mismo programa. Devuelve [{Id, Nombre, Resultado: cerrado|finalizado|error, Error}].
+    """
+    lista = json.dumps([{"Id": int(x["Id"]), "Nombre": str(x.get("Nombre") or "")} for x in procesos])
+    # Sin @(): en PowerShell 5.1, ConvertFrom-Json entrega la lista entera como un solo objeto
+    return ("$o = ConvertFrom-Json " + ps_texto(lista) + "; "
+            "function Vivo($x) { $p = Get-Process -Id $x.Id -ErrorAction SilentlyContinue; "
+            "if ($p -and $p.ProcessName -eq $x.Nombre) { $p } else { $null } }; "
+            "$pedido = $false; foreach ($x in $o) { $p = Vivo $x; if ($p -and $p.MainWindowHandle -ne 0) { "
+            "try { [void]$p.CloseMainWindow(); $pedido = $true } catch {} } }; "
+            "$fin = (Get-Date).AddSeconds($(if ($pedido) { " + str(int(espera)) + " } else { 0 })); "
+            "while ((Get-Date) -lt $fin -and @($o | Where-Object { Vivo $_ }).Count) { Start-Sleep -Milliseconds 300 }; "
+            "$r = @(foreach ($x in $o) { $p = Vivo $x; "
+            "if (-not $p) { [ordered]@{ Id = $x.Id; Nombre = $x.Nombre; Resultado = 'cerrado' }; continue }; "
+            "try { Stop-Process -Id $x.Id -Force -ErrorAction Stop; "
+            "[ordered]@{ Id = $x.Id; Nombre = $x.Nombre; Resultado = 'finalizado' } } "
+            "catch { [ordered]@{ Id = $x.Id; Nombre = $x.Nombre; Resultado = 'error'; Error = $_.Exception.Message } } }); "
+            "Start-Sleep -Milliseconds 500; "
+            "'" + MARCA_JSON + "' + (ConvertTo-Json -InputObject $r -Compress)")
+
+
+def resumir_finalizados(resultado: list) -> tuple[list[str], list[str]]:
+    """(«Chrome (3 procesos)»… que se cerraron, «nombre: motivo»… que no se pudieron finalizar)."""
+    cerrados: dict[str, int] = {}
+    fallos = []
+    for x in resultado or []:
+        if not isinstance(x, dict):
+            continue
+        if x.get("Resultado") in ("cerrado", "finalizado"):
+            cerrados[x.get("Nombre") or "?"] = cerrados.get(x.get("Nombre") or "?", 0) + 1
+        else:
+            motivo = str(x.get("Error") or "no se pudo").strip().rstrip(".")
+            fallos.append(f"{x.get('Nombre') or '?'} ({x.get('Id')}): {motivo}")
+    return [n + (f" ({c} procesos)" if c > 1 else "") for n, c in cerrados.items()], fallos
 
 
 # Tipos de instalador: winget no puede pasar un programa de MSIX (Store) a MSI/EXE ni al revés.
@@ -5077,6 +5441,11 @@ INTERCEPTORES_HTTPS = {"avast": "Avast", "avg": "AVG", "kaspersky": "Kaspersky",
                        "fortinet": "Fortinet", "fortigate": "Fortinet", "zscaler": "Zscaler", "netskope": "Netskope",
                        "trend micro": "Trend Micro", "webroot": "Webroot", "dr.web": "Dr.Web",
                        "check point": "Check Point", "palo alto": "Palo Alto", "cisco": "Cisco"}
+
+
+# Opción de administrador de winget: acepta la Store aunque un antivirus o un proxy cambie el certificado
+# (sigue comprobando que Windows confíe en él, pero ya no exige el de Microsoft)
+AJUSTE_PINNING_STORE = "BypassCertificatePinningForMicrosoftStore"
 
 
 def interceptor_https(emisor: str | None) -> str | None:
@@ -5310,8 +5679,8 @@ def evaluar_seguridad(datos: dict) -> dict:
         c.append(("aviso", "No se pudo leer «InstallerHashOverride»; winget comprueba el SHA256 igual, "
                            "pero no se pudo confirmar que nadie lo haya desactivado."))
         seg["hash_obligatorio"] = True
+    seg["sin_pinning_store"] = ajustes.get(AJUSTE_PINNING_STORE) is True
     for clave, texto in (("LocalManifestFiles", "permite instalar desde manifiestos locales"),
-                         ("BypassCertificatePinningForMicrosoftStore", "no fija el certificado de la Store"),
                          ("LocalArchiveMalwareScanOverride", "salta el análisis antivirus de los .zip")):
         if ajustes.get(clave) is True:
             c.append(("aviso", f"Opción de administrador «{clave}» activada: {texto}."))
@@ -5348,17 +5717,35 @@ def evaluar_seguridad(datos: dict) -> dict:
     # 4. ¿Alguien abre las conexiones HTTPS por el camino?
     tls = datos.get("Tls") if isinstance(datos.get("Tls"), dict) else {}
     quien = next((q for q in (interceptor_https(e) for e in tls.values()) if q), None)
+    protegido = ("Lo del repositorio winget sigue protegido: su catálogo va firmado por Microsoft y cada "
+                 "instalador se comprueba con su SHA256.")
     if quien:
         emisor = next(e for e in tls.values() if interceptor_https(e))
         seg["https_interceptado"] = quien
-        donde = ("en Avast: Menú → Configuración → General → Excepciones, agrega storeedgefd.dsx.mp.microsoft.com "
-                 "(si no basta, desactiva «Análisis HTTPS» en el Escudo web)" if quien in ("Avast", "AVG")
-                 else f"en {quien}, excluye storeedgefd.dsx.mp.microsoft.com de la inspección HTTPS")
-        c.append(("aviso", f"{quien[0].upper() + quien[1:]} inspecciona tus conexiones HTTPS: "
-                           f"pone su propio certificado («{nombre_del_certificado(emisor)}») en lugar del de Microsoft. "
-                           "Por eso winget no puede usar la Microsoft Store, que exige el certificado original "
-                           "(error 0x8A15005E). Lo del repositorio winget sigue protegido: su catálogo va firmado "
-                           f"por Microsoft y cada instalador se comprueba con su SHA256. Para arreglarlo, {donde}."))
+        Quien = quien[0].upper() + quien[1:]
+        if seg["sin_pinning_store"]:
+            c.append(("aviso", f"{Quien} inspecciona tus conexiones HTTPS (pone su certificado, "
+                               f"«{nombre_del_certificado(emisor)}»), y la Microsoft Store funciona igual porque "
+                               f"activaste «{AJUSTE_PINNING_STORE}»: winget comprueba que Windows confíe en el "
+                               "certificado, pero ya no exige el de Microsoft. " + protegido))
+        else:
+            # Una excepción de sitio web no basta: Avast sigue abriendo la conexión con su propio certificado
+            # (solo deja de revisar el contenido), y winget compara el certificado con el de Microsoft
+            en_antivirus = ("en Avast, desmarca solo «Análisis HTTPS» del Escudo web (Menú → Configuración → "
+                            "Protección → Escudos principales → Escudo web); no hace falta apagar todo el escudo. "
+                            "Agregar el sitio a las excepciones de Avast no basta: sigue poniendo su certificado"
+                            if quien in ("Avast", "AVG") else
+                            f"en {quien}, excluye storeedgefd.dsx.mp.microsoft.com de la inspección HTTPS")
+            c.append(("aviso", f"{Quien} inspecciona tus conexiones HTTPS: pone su propio certificado "
+                               f"(«{nombre_del_certificado(emisor)}») en lugar del de Microsoft, y winget exige el "
+                               "original para la Microsoft Store (error 0x8A15005E): por eso no salen sus "
+                               f"actualizaciones. {protegido} Para usar la Store: 1) permítelo en winget con el botón "
+                               "«Permitir la Store con la inspección HTTPS» (como administrador), o 2) "
+                               f"{en_antivirus}, o 3) actualiza esas apps desde la propia Microsoft Store."))
+    elif seg["sin_pinning_store"]:
+        c.append(("aviso", f"Opción de administrador «{AJUSTE_PINNING_STORE}» activada: winget no exige el "
+                           "certificado de Microsoft para la Store, y ya no hay nada que inspeccione tu HTTPS. "
+                           "Puedes volver a exigirlo con el botón «Volver a exigir el certificado de la Store»."))
 
     # 5. Permisos
     if seg["admin"]:
@@ -5426,6 +5813,61 @@ def windows_installer_ocupado() -> bool:
         return False
 
 
+# ─── Descarga por adelantado ────────────────────────────────────────────────
+# Antes de descargar, «winget upgrade» busca el instalador en su carpeta temporal,
+# %TEMP%\WinGet\<Id>.<Versión>\<sha256>: si está y su SHA256 coincide con el del manifiesto, lo usa
+# sin volver a bajarlo (y si no coincide, lo borra y descarga). Ahí se deja lo que bajó «winget download».
+ADELANTO_PREPARACION = 3        # cuántos paquetes, como mucho, se preparan por delante del que se instala
+RE_NOMBRE_INVALIDO = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def carpeta_temporal_winget() -> Path:
+    """%TEMP%\\WinGet, con la misma carpeta temporal que usa winget (GetTempPath)."""
+    if ES_WINDOWS:
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(1024)
+            if ctypes.windll.kernel32.GetTempPathW(1024, buf):
+                return Path(buf.value) / "WinGet"
+        except Exception:
+            pass
+    return Path(tempfile.gettempdir()) / "WinGet"
+
+
+def guardar_para_winget(archivo: Path, id_: str, version: str) -> dict | None:
+    """
+    Mueve un instalador bajado con «winget download» a donde «winget upgrade» lo busca.
+    {ruta, sha256}, o None si «Id.Versión» no sirve como nombre de carpeta.
+    """
+    import hashlib
+    nombre = f"{id_}.{version}"
+    if RE_NOMBRE_INVALIDO.search(nombre) or nombre != nombre.rstrip(". ") or nombre.strip(".") == "":
+        return None
+    h = hashlib.sha256()
+    with open(archivo, "rb") as fh:
+        for bloque in iter(lambda: fh.read(1 << 20), b""):
+            h.update(bloque)
+    carpeta = carpeta_temporal_winget() / nombre
+    carpeta.mkdir(parents=True, exist_ok=True)
+    destino = carpeta / h.hexdigest()
+    if destino.exists():
+        destino.unlink()
+    shutil.move(str(archivo), str(destino))
+    return {"ruta": str(destino), "sha256": h.hexdigest()}
+
+
+def borrar_guardado_winget(guardado: dict | None):
+    """Lo que se dejó para winget y no llegó a usar (se omitió, falló o se canceló)."""
+    if not guardado:
+        return
+    ruta = Path(guardado["ruta"])
+    try:
+        ruta.unlink(missing_ok=True)
+        ruta.parent.rmdir()             # solo si quedó vacía
+    except OSError:
+        pass
+
+
 # ─── Ejecutor de PowerShell ─────────────────────────────────────────────────
 
 class ResultadoProceso:
@@ -5477,11 +5919,7 @@ class ProcesoExterno(QObject):
         self._hilo.start()
 
     def _trabajar(self, corrida: int, programa: str, args: list[str]):
-        env = None
-        if programa == POWERSHELL and "PSModulePath" in os.environ:
-            # Si la app se abrió desde PowerShell 7, hereda su PSModulePath y Windows PowerShell 5.1
-            # no puede cargar Get-AuthenticodeSignature: sin ella, usa sus módulos de siempre
-            env = {k: v for k, v in os.environ.items() if k.lower() != "psmodulepath"}
+        env = entorno_powershell() if programa == POWERSHELL else None
         try:
             proc = subprocess.Popen(linea_de_comando(programa, args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, creationflags=FLAGS_SIN_VENTANA, env=env)
@@ -5591,6 +6029,8 @@ DEFAULT_ACTUALIZAR = {
     "detener_si_falla": False,
     "sugerir_admin": True,
     "avisar_abiertos": True,
+    "finalizar_abiertos": False,
+    "preparar_en_paralelo": True,
     "comparar_github": True,
     "tiempo_max": 30,
     "guardar_reporte": True,
@@ -6082,6 +6522,133 @@ def comprobar_fila_reporte(f: dict, actual: dict | None):
                       f"({actual['disponible']}).")
 
 
+class CarrilFondo(QObject):
+    """
+    Un segundo flujo que corre a la par del principal, con su propio proceso: Actualizaciones lo usa
+    para ir verificando y descargando los siguientes paquetes mientras se instala otro. Entiende los
+    mismos pasos (winget o PowerShell, Pausa, EnHilo), pero no escribe la salida de los programas:
+    solo pasa el avance de las descargas a al_avance.
+    """
+    _resultado_hilo = pyqtSignal(int, object)      # (turno, resultado) de un paso EnHilo
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._flujo = None
+        self._turno = 0
+        self._datos = None
+        self._tiempo_agotado = False
+        self.abortado = False
+        self.al_avance = None                       # función(texto de la barra de winget)
+        self._al_terminar = None
+        self._proceso = ProcesoExterno(self)
+        self._proceso.linea.connect(self._linea)
+        self._proceso.avance.connect(self._avance)
+        self._proceso.terminado.connect(self._terminado)
+        self._resultado_hilo.connect(self._recibir_hilo)
+        self._limite = QTimer(self)
+        self._limite.setSingleShot(True)
+        self._limite.timeout.connect(self._limite_superado)
+
+    def activo(self) -> bool:
+        return self._flujo is not None
+
+    def iniciar(self, generador, al_terminar=None):
+        self.detener()
+        self._flujo, self._al_terminar = generador, al_terminar
+        self.abortado = False
+        turno = self._turno
+        QTimer.singleShot(0, lambda: turno == self._turno and self._avanzar(None))
+
+    def _avanzar(self, valor):
+        if self._flujo is None:
+            return
+        try:
+            paso = self._flujo.send(valor)
+        except StopIteration:
+            self._fin()
+            return
+        except Exception:
+            import traceback
+            escribir_fallo(f"[Error en Actualizaciones, segundo plano]\n{traceback.format_exc()}")
+            self._fin()
+            return
+        self._turno += 1
+        turno = self._turno
+        if isinstance(paso, Pausa):
+            QTimer.singleShot(int(paso.segundos * 1000), lambda: turno == self._turno and self._avanzar(None))
+            return
+        if isinstance(paso, EnHilo):
+            def trabajar(funcion=paso.funcion):
+                try:
+                    resultado = funcion()
+                except Exception as e:
+                    resultado = e
+                self._resultado_hilo.emit(turno, resultado)
+            threading.Thread(target=trabajar, daemon=True, name="carril_fondo").start()
+            return
+        programa, args, _, limite = paso
+        self._datos, self._tiempo_agotado = None, False
+        if limite:
+            self._limite.start(int(limite * 1000))
+        self._proceso.iniciar(programa, args)
+
+    def _recibir_hilo(self, turno: int, resultado):
+        if turno == self._turno:
+            QTimer.singleShot(0, lambda: turno == self._turno and self._avanzar(resultado))
+
+    def _linea(self, linea: str):
+        if linea.startswith(MARCA_JSON):
+            try:
+                self._datos = json.loads(linea[len(MARCA_JSON):])
+            except ValueError:
+                pass
+
+    def _avance(self, texto: str):
+        visible = texto.split("\r")[-1]
+        if self.al_avance is not None and ("█" in visible or "▒" in visible):
+            self.al_avance(visible)
+
+    def _terminado(self, codigo: int, arranco: bool):
+        self._limite.stop()
+        if self._flujo is None:
+            return
+        codigo = 0xFFFFFFFF if not arranco else codigo & 0xFFFFFFFF
+        resultado = ResultadoProceso(codigo, list(self._proceso.lineas), self._datos, arranco, self.abortado,
+                                     self._tiempo_agotado)
+        turno = self._turno
+        QTimer.singleShot(0, lambda: turno == self._turno and self._avanzar(resultado))
+
+    def _limite_superado(self):
+        self._tiempo_agotado = True
+        self._proceso.matar()
+
+    def _fin(self):
+        self._flujo = None
+        accion, self._al_terminar = self._al_terminar, None
+        if accion is not None:
+            accion()
+
+    def detener(self):
+        """Corta ya: mata el programa en curso y cierra el flujo (sus «finally» limpian lo temporal)."""
+        if self._flujo is None:
+            return
+        self.abortado = True
+        self._turno += 1                    # lo que llegue tarde ya no despierta a nadie
+        self._limite.stop()
+        self._proceso.matar()
+        flujo, self._flujo = self._flujo, None
+        try:
+            flujo.close()
+        except Exception:
+            pass
+        accion, self._al_terminar = self._al_terminar, None
+        if accion is not None:
+            accion()
+
+    def esperar(self, ms: int = 3000):
+        self._proceso.esperar(ms)
+
+
 class PaginaActualizar(QWidget):
     """
     Busca actualizaciones con winget, las muestra en una tabla (seleccionar, ordenar, filtrar),
@@ -6127,6 +6694,15 @@ class PaginaActualizar(QWidget):
         self._proceso.linea.connect(self._linea_proceso)
         self._proceso.avance.connect(self._avance_proceso)
         self._proceso.terminado.connect(self._proceso_terminado)
+        # Segundo plano: prepara (verifica y descarga) los siguientes mientras se instala uno
+        self._carril = CarrilFondo(self)
+        self._carril.al_avance = self._avance_fondo
+        self._preparados: dict[str, dict] = {}      # clave → {"verifico": bool, "ok": bool}
+        self._fondo_en: str | None = None           # el que se está preparando ahora
+        self._indice_instalando = -1                # su posición en el lote
+        self._siguiendo_fondo = False               # la barra muestra la preparación (se espera a que acabe)
+        self._pct_fondo = -1
+        self._hubo_descarga = False                 # winget descargó en este paso (no reutilizó nada)
         # Fase del paso en curso (qué hace winget ahora), para la barra y el texto de estado
         self._prefijo = ""                  # «[2/5] Firefox»
         self._fase: str | None = None       # None = el estado lo puso otro texto
@@ -6327,6 +6903,10 @@ class PaginaActualizar(QWidget):
         cab_s = QHBoxLayout()
         cab_s.addWidget(titulo_card("Seguridad"))
         cab_s.addStretch(1)
+        self.btn_store = boton("Permitir la Store con la inspección HTTPS…", "fantasma")
+        self.btn_store.clicked.connect(self._cambiar_pinning_store)
+        self.btn_store.setVisible(False)
+        cab_s.addWidget(self.btn_store)
         self.btn_como = boton("¿Cómo se protege cada actualización?", "fantasma")
         self.btn_como.setCheckable(True)
         cab_s.addWidget(self.btn_como)
@@ -6412,6 +6992,8 @@ class PaginaActualizar(QWidget):
         self.chk_detener.setChecked(bool(self.sec["detener_si_falla"]))
         self.chk_sugerir_admin.setChecked(bool(self.sec["sugerir_admin"]))
         self.chk_abiertos.setChecked(bool(self.sec["avisar_abiertos"]))
+        self.chk_finalizar.setChecked(bool(self.sec["finalizar_abiertos"]))
+        self.chk_paralelo.setChecked(bool(self.sec["preparar_en_paralelo"]))
         self.chk_github.setChecked(bool(self.sec["comparar_github"]))
         self.sp_limite.setValue(int(self.sec["tiempo_max"]))
         self.chk_reporte.setChecked(bool(self.sec["guardar_reporte"]))
@@ -6421,6 +7003,7 @@ class PaginaActualizar(QWidget):
                     self.chk_ignorados.toggled, self.combo_modo.currentIndexChanged, self.chk_verificar.toggled,
                     self.chk_firma.toggled, self.chk_sin_firma.toggled, self.chk_reanalizar.toggled,
                     self.chk_detener.toggled, self.chk_sugerir_admin.toggled, self.chk_abiertos.toggled,
+                    self.chk_finalizar.toggled, self.chk_paralelo.toggled,
                     self.chk_github.toggled, self.sp_limite.valueChanged, self.chk_reporte.toggled):
             sig.connect(self._opciones_cambiadas)
         self.lista_ignorados.cambiado.connect(self._ignorados_cambiados)
@@ -6442,10 +7025,12 @@ class PaginaActualizar(QWidget):
         """Al cerrar la ventana: corta ya (la ventana ya pidió confirmación)."""
         if self._flujo is not None:
             self._abortado = True
+            self._carril.detener()
             self._proceso.matar()
 
     def esperar(self, ms: int = 3000):
         self._proceso.esperar(ms)
+        self._carril.esperar(ms)
 
     def estado(self, texto: str):
         self._fase = None
@@ -6485,8 +7070,23 @@ class PaginaActualizar(QWidget):
 
     def _avance_proceso(self, texto: str):
         """Redibujo de la barra de winget: % real, tamaño, velocidad y tiempo restante."""
-        if not self._mostrar_salida:
+        if self._mostrar_salida:
+            self._mostrar_avance(texto)
+
+    def _avance_fondo(self, texto: str):
+        """La descarga que va en segundo plano: en su fila y, si se está esperando a que acabe, en la barra."""
+        if self._siguiendo_fondo:
+            self._mostrar_avance(texto)
+        lectura = leer_barra_winget(texto)
+        p = self._paquetes.get(self._fondo_en or "")
+        if lectura is None or p is None:
             return
+        pct = int(lectura[0] * 100)
+        if pct // 5 != self._pct_fondo // 5:            # sin redibujar la tabla en cada redibujo de winget
+            self._pct_fondo = pct
+            self._poner_estado(p, "info", f"Preparando: descargando {pct} %")
+
+    def _mostrar_avance(self, texto: str):
         lectura = leer_barra_winget(texto)
         if lectura is None:
             return
@@ -6513,6 +7113,7 @@ class PaginaActualizar(QWidget):
         """Lo que winget va diciendo (descargando, hash comprobado, instalando…) pasa a la barra y al estado."""
         m = RE_FASE_DESCARGA.search(visible)
         if m:
+            self._hubo_descarga = True
             self._descarga, self._sitio_descarga = None, dominio(m.group(2))
             self._poner_fase("descarga", f"Descargando de {self._sitio_descarga}…", 0.0)
         elif RE_HASH_OK.search(visible):
@@ -6571,16 +7172,28 @@ class PaginaActualizar(QWidget):
         if ES_WINDOWS:
             QTimer.singleShot(300, lambda: self.analizar())
 
-    def _confirmar_inicio(self, texto: str) -> bool:
+    def _aviso_finalizar(self, opciones: dict) -> str | None:
+        """Con «Finalizarlos sin preguntar» activo, la advertencia que se acepta antes de empezar."""
+        if not (opciones["avisar_abiertos"] and opciones["finalizar_abiertos"]):
+            return None
+        return ("⚠ Está activado «Finalizar sin preguntar los programas abiertos»: si alguno de estos programas "
+                "(o algo que use sus archivos, como un navegador con la cámara virtual de OBS) está abierto, se le "
+                "pide cerrarse y, si sigue abierto a los 10 s, se finaliza. Perderás lo que no hayas guardado en "
+                "él: guarda tu trabajo antes de aceptar. Los procesos de Windows nunca se tocan.")
+
+    def _confirmar_inicio(self, texto: str, aviso: str | None = None) -> bool:
         """
         Pregunta antes de instalar. Sin permisos de administrador (y con la opción activa) ofrece
-        reabrir la app así antes de empezar. True = empezar ya.
+        reabrir la app así antes de empezar. aviso: advertencia que va primero (ej. finalizar programas).
+        True = empezar ya.
         """
         if self.sin_dialogos:
             return True
         caja = QMessageBox(self)
-        caja.setIcon(QMessageBox.Icon.Question)
+        caja.setIcon(QMessageBox.Icon.Warning if aviso else QMessageBox.Icon.Question)
         caja.setWindowTitle(APP_NOMBRE)
+        if aviso:
+            texto = f"{aviso}\n\n{texto}"
         if self.es_admin or not ES_WINDOWS or not self.chk_sugerir_admin.isChecked():
             if not self.es_admin:
                 texto += "\n\nAlgunos instaladores pueden pedir permiso de administrador."
@@ -6650,7 +7263,17 @@ class PaginaActualizar(QWidget):
                                   "manifiesto con el que GitHub calculó cuando el autor subió el archivo")
         self.chk_abiertos = casilla("Antes de cada programa, revisar si está abierto",
                                     "Busca qué programas tienen abiertos archivos de su carpeta (ej. la cámara virtual "
-                                    "de OBS en Chrome o Claude) y te dice cuáles cerrar")
+                                    "de OBS en Chrome o Claude) y te dice cuáles cerrar; desde ese aviso también "
+                                    "puedes finalizarlos")
+        self.chk_finalizar = casilla("Finalizarlos sin preguntar (⚠ pierdes lo que no hayas guardado en ellos)",
+                                     "Si un programa a actualizar está abierto, se le pide cerrarse y, si sigue "
+                                     "abierto a los 10 s, se finaliza a la fuerza. Nunca se tocan los procesos de "
+                                     "Windows (Explorador, servicios…). Al pulsar «Actualizar» se avisa antes.")
+        self.chk_paralelo = casilla("Ir descargando y verificando los siguientes mientras se instala otro",
+                                    "Mientras se instala uno, se preparan los siguientes (hasta "
+                                    f"{ADELANTO_PREPARACION} por delante): manifiesto, SHA256, firma y descarga. "
+                                    "winget reutiliza esa descarga (vuelve a comprobar su SHA256). "
+                                    "Las instalaciones siguen siendo de una en una.")
         self.chk_detener = casilla("Detener todo si una actualización falla",
                                    "Los que falten quedan como «omitidos» en el reporte")
         self.chk_sugerir_admin = casilla("Sugerir reabrir como administrador antes de actualizar",
@@ -6698,7 +7321,12 @@ class PaginaActualizar(QWidget):
         sangria.addWidget(self.chk_sin_firma, 1)
         lay.addLayout(sangria)
         lay.addWidget(self.chk_github)
+        lay.addWidget(self.chk_paralelo)
         lay.addWidget(self.chk_abiertos)
+        sangria = QHBoxLayout()
+        sangria.addSpacing(SPACING_LG + SPACING_XS)
+        sangria.addWidget(self.chk_finalizar, 1)
+        lay.addLayout(sangria)
         lay.addWidget(self.chk_detener)
         lay.addWidget(self.chk_sugerir_admin)
         lay.addSpacing(SPACING_XS)
@@ -6766,6 +7394,8 @@ class PaginaActualizar(QWidget):
         self.chk_detener.setChecked(o["detener_si_falla"])
         self.chk_sugerir_admin.setChecked(o["sugerir_admin"])
         self.chk_abiertos.setChecked(o["avisar_abiertos"])
+        self.chk_finalizar.setChecked(o["finalizar_abiertos"])
+        self.chk_paralelo.setChecked(o["preparar_en_paralelo"])
         self.chk_github.setChecked(o["comparar_github"])
         self.sp_limite.setValue(o["tiempo_max"])
         self.chk_reporte.setChecked(o["guardar_reporte"])
@@ -6776,10 +7406,14 @@ class PaginaActualizar(QWidget):
         modo = {"silencioso": "modo silencioso", "normal": "con la ventana del instalador",
                 "interactivo": "modo interactivo"}.get(o["modo"], o["modo"])
         partes = ["Uno por uno, en el orden de la tabla", modo]
+        if o["preparar_en_paralelo"]:
+            partes.append("prepara los siguientes mientras instala")
         if o["verificar_antes"]:
             partes.append("verifica el manifiesto antes")
         if o["comprobar_firma"]:
             partes.append("revisa la firma digital" + (" (omite los que no tengan)" if o["omitir_sin_firma"] else ""))
+        if o["avisar_abiertos"] and o["finalizar_abiertos"]:
+            partes.append("⚠ finaliza sin preguntar los programas abiertos")
         partes.append(f"máx. {o['tiempo_max']} min por paquete" if o["tiempo_max"] else "sin límite de tiempo")
         if o["detener_si_falla"]:
             partes.append("se detiene si uno falla")
@@ -6799,6 +7433,8 @@ class PaginaActualizar(QWidget):
             "detener_si_falla": self.chk_detener.isChecked(),
             "sugerir_admin": self.chk_sugerir_admin.isChecked(),
             "avisar_abiertos": self.chk_abiertos.isChecked(),
+            "finalizar_abiertos": self.chk_finalizar.isChecked(),
+            "preparar_en_paralelo": self.chk_paralelo.isChecked(),
             "comparar_github": self.chk_github.isChecked(),
             "tiempo_max": self.sp_limite.value(),
             "guardar_reporte": self.chk_reporte.isChecked(),
@@ -6806,6 +7442,7 @@ class PaginaActualizar(QWidget):
 
     def _opciones_cambiadas(self, *_):
         self.chk_sin_firma.setEnabled(self.chk_firma.isChecked())
+        self.chk_finalizar.setEnabled(self.chk_abiertos.isChecked())
         self.sec.update(self.opciones())
         self.config.guardar()
         if self._paquetes:
@@ -6964,6 +7601,7 @@ class PaginaActualizar(QWidget):
     def _terminar_flujo(self):
         self._flujo = None
         self._en_curso = None
+        self._parar_preparacion()
         self._reloj_fase.stop()
         self._fase, self._prefijo = None, ""
         if self._abortado:
@@ -6987,6 +7625,8 @@ class PaginaActualizar(QWidget):
         if self._flujo is not None:
             self._detener = True
             self.btn_detener.setEnabled(False)
+            if self._carril.activo():
+                self._carril.detener()          # ya no hace falta preparar los siguientes
             self.consola.agregar("Se detendrá al terminar el paquete actual.", "aviso")
 
     def _cancelar_confirmando(self):
@@ -7001,6 +7641,7 @@ class PaginaActualizar(QWidget):
                 return
         self._abortado = True
         self.estado("Cancelando…")
+        self._carril.detener()
         self._proceso.matar()
 
     # ─── salida de winget y de PowerShell ───
@@ -7146,9 +7787,16 @@ class PaginaActualizar(QWidget):
             yield from self._pasos_verificar(p, con_firma, estricto=p["grupo"] == "lote")
         self.estado("Verificación terminada.")
 
-    def _pasos_verificar(self, p: dict, con_firma: bool, estricto: bool):
-        """Devuelve True si el paquete se puede instalar (con estricto=False, solo informa)."""
+    def _pasos_verificar(self, p: dict, con_firma: bool, estricto: bool, guardar: bool = False,
+                         fondo: bool = False):
+        """
+        Devuelve True si el paquete se puede instalar (con estricto=False, solo informa).
+        guardar: lo que se descargue se deja para que «winget upgrade» no lo vuelva a bajar.
+        fondo: corre en segundo plano (CarrilFondo): no toca la barra ni el estado, y descarga por
+        adelantado aunque no haya que revisar la firma.
+        """
         w = self._seguridad["winget"]
+        fase = (lambda *_: None) if fondo else self._poner_fase
         args = self._args_show(p)
         self.consola.agregar(f"🔍 {p['nombre']}: " + comando_visible(args), "suave")
         r = yield self._winget(w, args, False, 180)
@@ -7173,7 +7821,7 @@ class PaginaActualizar(QWidget):
 
         # Segunda fuente del SHA256: el que GitHub calculó cuando el autor subió el archivo a la release
         if self.chk_github.isChecked() and info.get("sha256") and RE_GITHUB_RELEASE.match(info.get("url") or ""):
-            self._poner_fase("github", "Comparando el SHA256 con el que publica GitHub…", None)
+            fase("github", "Comparando el SHA256 con el que publica GitHub…", None)
             gh = yield EnHilo(lambda: digest_de_github(info["url"]))
             if self._abortado:
                 return False
@@ -7186,7 +7834,7 @@ class PaginaActualizar(QWidget):
                 return False
 
         # ¿winget puede pasar de lo instalado a lo que ofrece? (de MSIX a MSI/EXE, o al revés, no puede)
-        self._poner_fase("detalles", "Leyendo cómo está instalado (winget list --details)…", None)
+        fase("detalles", "Leyendo cómo está instalado (winget list --details)…", None)
         detalles = yield from self._detalles_instalado(w, p)
         if self._abortado:
             return False
@@ -7198,7 +7846,7 @@ class PaginaActualizar(QWidget):
             self._refrescar_fila(p)
 
         # ¿Cómo actualiza? (manifiesto de winget-pkgs): desinstalar antes, permisos de administrador, conda
-        self._poner_fase("detalles", "Leyendo cómo actualiza su instalador (manifiesto de winget-pkgs)…", None)
+        fase("detalles", "Leyendo cómo actualiza su instalador (manifiesto de winget-pkgs)…", None)
         como = yield from self._como_actualiza(w, p)
         if self._abortado:
             return False
@@ -7219,71 +7867,122 @@ class PaginaActualizar(QWidget):
             if v["tipo"] == "error":
                 return False
 
-        if con_firma and p["origen"] in ORIGENES_EN_LOTE:
-            # winget comprueba el SHA256 al descargar; luego PowerShell revisa la firma y lo recalcula.
-            # La carpeta temporal se borra siempre, aunque se cancele.
-            carpeta = Path(tempfile.mkdtemp(prefix="utilidades_winget_"))
-            firma = None
-            try:
-                args = ["download", "--id", p["id"], "--exact", "--source", p["origen"], "--version",
-                        p["disponible"], "--download-directory", str(carpeta), "--accept-package-agreements",
-                        "--accept-source-agreements", "--disable-interactivity"]
+        if p["origen"] in ORIGENES_EN_LOTE and (con_firma or (fondo and self._vale_descargar(p))):
+            ok = yield from self._descargar_y_revisar(p, con_firma, guardar, fondo)
+            if not ok:
+                return False
+        return True
+
+    def _vale_descargar(self, p: dict) -> bool:
+        """¿Sirve bajarlo por adelantado? (winget no usa la descarga de un MSIX ni se actualiza conda así)."""
+        v = p["verif"]
+        if p["origen"] not in ORIGENES_EN_LOTE or es_distribucion_conda(p["id"]) or (v.get("como") or {}).get("conda"):
+            return False
+        if tipo_base(v.get("tipo_instalador")) in TIPOS_MSIX:
+            return False
+        guardado = p.get("descargado")
+        return not (guardado and os.path.isfile(guardado["ruta"]))
+
+    def _descargar_y_revisar(self, p: dict, con_firma: bool, guardar: bool, fondo: bool = False):
+        """
+        «winget download» a una carpeta temporal (winget comprueba el SHA256 al descargar).
+        con_firma: PowerShell revisa la firma y recalcula el SHA256; devuelve False si no pasa.
+        guardar: deja el instalador donde «winget upgrade» lo reutiliza (p["descargado"]).
+        La carpeta temporal se borra siempre, aunque se cancele.
+        """
+        w = self._seguridad["winget"]
+        v = p["verif"]
+        fase = (lambda *_: None) if fondo else self._poner_fase
+        carpeta = Path(tempfile.mkdtemp(prefix="utilidades_winget_"))
+        firma = None
+        codigo = None
+        try:
+            # El mismo ámbito y arquitectura que lo instalado: así se baja el instalador que usará «upgrade»
+            detalles = p.get("instalado") or {}
+            ambito = {"machine": "machine", "user": "user"}.get((detalles.get("ambito") or "").lower())
+            arquitectura = (detalles.get("arquitectura") or "").lower()
+            filtros = (["--scope", ambito] if ambito else []) + (
+                ["--architecture", arquitectura] if arquitectura in ("x86", "x64", "arm", "arm64") else [])
+            for intento in (filtros, []):
+                args = (["download", "--id", p["id"], "--exact", "--source", p["origen"], "--version", p["disponible"]]
+                        + intento + ["--download-directory", str(carpeta), "--accept-package-agreements",
+                                     "--accept-source-agreements", "--disable-interactivity"])
                 self.consola.agregar(f"⬇ {p['nombre']}: " + comando_visible(args), "suave")
-                self._empezar_paso(self._prefijo or p["nombre"], "Descargando el instalador para revisar su firma…")
+                if not fondo:
+                    self._empezar_paso(self._prefijo or p["nombre"], "Descargando el instalador para revisar su firma…"
+                                       if con_firma else "Descargando el instalador…")
                 r = yield self._winget(w, args, True, 1800)
                 if r.abortado or r.tiempo_agotado:
                     return False
-                if r.codigo == 0:
-                    archivos = [f for f in carpeta.rglob("*")
-                                if f.is_file() and f.suffix.lower() not in (".yaml", ".yml")]
-                    archivo = max(archivos, key=lambda f: f.stat().st_size, default=None)
-                    if archivo is not None:
-                        # Lo que Get-AuthenticodeSignature no sabe leer: lo de dentro de un zip/nupkg, o un MSIX
-                        interno = {}
-                        if archivo.suffix.lower() in EXT_COMPRIMIDOS + EXT_PAQUETE_MSIX:
-                            self._poner_fase("firma", f"Abriendo «{archivo.name}» para revisar lo de dentro…", None)
-                            interno = yield EnHilo(lambda: preparar_revision_interna(archivo, carpeta))
-                            if self._abortado:
-                                return False
-                            if isinstance(interno, Exception):
-                                self.consola.agregar(f"No se pudo abrir «{archivo.name}» para revisar lo de dentro: "
-                                                     f"{interno}", "aviso")
-                                interno = {}
-                        internos = interno.get("internos") or []
-                        extra = (f" y de los {len(internos)} instalador(es) de dentro" if internos
-                                 else " y la firma del paquete MSIX" if interno.get("msix") else "")
-                        self.consola.agregar(f"🔏 {p['nombre']}: Get-AuthenticodeSignature y Get-FileHash "
-                                             f"de «{archivo.name}»{extra}", "suave")
-                        self._poner_fase("firma", "Revisando la firma digital (PowerShell)…", None)
-                        r2 = yield self._powershell(script_firma_archivo(str(archivo), [x[0] for x in internos],
-                                                                         interno.get("msix")), 300)
-                        if r2.abortado:
+                if r.codigo != 0x8A150010 or not intento:      # 0x8A150010: ningún instalador con esos filtros
+                    break
+            codigo = r.codigo
+            if r.codigo == 0:
+                archivos = [f for f in carpeta.rglob("*")
+                            if f.is_file() and f.suffix.lower() not in (".yaml", ".yml")]
+                archivo = max(archivos, key=lambda f: f.stat().st_size, default=None)
+                if archivo is not None and con_firma:
+                    # Lo que Get-AuthenticodeSignature no sabe leer: lo de dentro de un zip/nupkg, o un MSIX
+                    interno = {}
+                    if archivo.suffix.lower() in EXT_COMPRIMIDOS + EXT_PAQUETE_MSIX:
+                        fase("firma", f"Abriendo «{archivo.name}» para revisar lo de dentro…", None)
+                        interno = yield EnHilo(lambda: preparar_revision_interna(archivo, carpeta))
+                        if self._abortado:
                             return False
-                        firma = dict(r2.datos or {"Estado": "SinRespuesta"}, Archivo=archivo.name,
-                                     Bytes=archivo.stat().st_size)
-                        datos_internos = firma.get("Internos")
-                        if isinstance(datos_internos, dict):         # PowerShell 5.1 devuelve uno solo sin lista
-                            firma["Internos"] = datos_internos = [datos_internos]
-                        for dato, (_, nombre) in zip(datos_internos or [], internos):
-                            if isinstance(dato, dict):
-                                dato["Nombre"] = nombre
-            finally:
-                shutil.rmtree(carpeta, ignore_errors=True)
-            tipo, texto = evaluar_firma(firma, v.get("sha256"), r.codigo)
-            v["firma"] = {"tipo": tipo, "texto": texto, "datos": firma}
-            if tipo == "sin_firma" and p["id"].lower() in self._sin_firma_aceptados():
-                self._aplicar_sin_firma_aceptado(p)
-            else:
-                componer_verificacion(v)
-            tipo, texto = v["firma"]["tipo"], v["firma"]["texto"]
-            self.consola.agregar(f"{ICONOS_TIPO[tipo]} {p['nombre']}: {texto}"
-                                 + (f" (emitido por {nombre_del_certificado((firma or {}).get('Emisor'))})"
-                                    if tipo == "ok" and (firma or {}).get("Estado") == "Valid" else ""),
-                                 tipo if tipo != "sin_firma" else "aviso")
-            self._refrescar_fila(p)
-            if tipo == "error" or (tipo == "sin_firma" and self.chk_sin_firma.isChecked()):
-                return False
-        return True
+                        if isinstance(interno, Exception):
+                            self.consola.agregar(f"No se pudo abrir «{archivo.name}» para revisar lo de dentro: "
+                                                 f"{interno}", "aviso")
+                            interno = {}
+                    internos = interno.get("internos") or []
+                    extra = (f" y de los {len(internos)} instalador(es) de dentro" if internos
+                             else " y la firma del paquete MSIX" if interno.get("msix") else "")
+                    self.consola.agregar(f"🔏 {p['nombre']}: Get-AuthenticodeSignature y Get-FileHash "
+                                         f"de «{archivo.name}»{extra}", "suave")
+                    fase("firma", "Revisando la firma digital (PowerShell)…", None)
+                    r2 = yield self._powershell(script_firma_archivo(str(archivo), [x[0] for x in internos],
+                                                                     interno.get("msix")), 300)
+                    if r2.abortado:
+                        return False
+                    firma = dict(r2.datos or {"Estado": "SinRespuesta"}, Archivo=archivo.name,
+                                 Bytes=archivo.stat().st_size)
+                    datos_internos = firma.get("Internos")
+                    if isinstance(datos_internos, dict):         # PowerShell 5.1 devuelve uno solo sin lista
+                        firma["Internos"] = datos_internos = [datos_internos]
+                    for dato, (_, nombre) in zip(datos_internos or [], internos):
+                        if isinstance(dato, dict):
+                            dato["Nombre"] = nombre
+                if archivo is not None and guardar:
+                    guardado = yield EnHilo(lambda: guardar_para_winget(archivo, p["id"], p["disponible"]))
+                    if self._abortado:
+                        return False
+                    if isinstance(guardado, dict):
+                        previo = p.get("descargado")
+                        if previo and previo["ruta"] != guardado["ruta"]:
+                            borrar_guardado_winget(previo)
+                        p["descargado"] = guardado
+                    elif isinstance(guardado, Exception):
+                        self.consola.agregar(f"No se pudo dejar la descarga de {p['nombre']} lista para winget "
+                                             f"({guardado}): la bajará otra vez al instalar.", "suave")
+            elif not con_firma:
+                self.consola.agregar(f"No se pudo descargar {p['nombre']} por adelantado ({codigo_hex(r.codigo)}): "
+                                     "winget lo descargará al instalar.", "suave")
+        finally:
+            shutil.rmtree(carpeta, ignore_errors=True)
+        if not con_firma:
+            return True
+        tipo, texto = evaluar_firma(firma, v.get("sha256"), codigo)
+        v["firma"] = {"tipo": tipo, "texto": texto, "datos": firma}
+        if tipo == "sin_firma" and p["id"].lower() in self._sin_firma_aceptados():
+            self._aplicar_sin_firma_aceptado(p)
+        else:
+            componer_verificacion(v)
+        tipo, texto = v["firma"]["tipo"], v["firma"]["texto"]
+        self.consola.agregar(f"{ICONOS_TIPO[tipo]} {p['nombre']}: {texto}"
+                             + (f" (emitido por {nombre_del_certificado((firma or {}).get('Emisor'))})"
+                                if tipo == "ok" and (firma or {}).get("Estado") == "Valid" else ""),
+                             tipo if tipo != "sin_firma" else "aviso")
+        self._refrescar_fila(p)
+        return not (tipo == "error" or (tipo == "sin_firma" and self.chk_sin_firma.isChecked()))
 
     def actualizar_seleccionadas(self):
         if not self._seguridad or not self._seguridad.get("genuino"):
@@ -7302,8 +8001,10 @@ class PaginaActualizar(QWidget):
                   f"{self._paquetes[c]['disponible']}" for c in claves[:12]]
         if len(claves) > 12:
             lineas.append(f"… y {len(claves) - 12} más")
+        aviso = self._aviso_finalizar(opciones)
         if not self._confirmar_inicio(f"Se van a actualizar {len(claves)} programa(s), uno por uno:\n\n"
-                                      + "\n".join(lineas) + "\n\nCierra esos programas antes de empezar."):
+                                      + "\n".join(lineas)
+                                      + ("" if aviso else "\n\nCierra esos programas antes de empezar."), aviso):
             return
         self._iniciar_flujo(self._flujo_actualizar(claves, opciones), "actualizar", "Actualizando…",
                             al_terminar=self._al_terminar_actualizacion)
@@ -7320,9 +8021,14 @@ class PaginaActualizar(QWidget):
             self._poner_estado(p, "pendiente", "En cola")
         self._reporte = reporte
         total = len(claves)
+        # Mientras se instala uno, otro carril va verificando y descargando los siguientes
+        self._preparados, self._fondo_en, self._indice_instalando = {}, None, -1
+        if opciones["preparar_en_paralelo"] and total > 1:
+            self._carril.iniciar(self._flujo_preparar(claves, opciones))
         for i, clave in enumerate(claves, 1):
             p = self._paquetes[clave]
             fila = reporte["filas"][clave]
+            self._indice_instalando = i - 1
             if self._abortado:
                 break
             if self._detener:
@@ -7331,15 +8037,29 @@ class PaginaActualizar(QWidget):
                 continue
             prefijo = f"[{i}/{total}] {p['nombre']}"
 
-            # 1. Verificación previa
-            v = p["verif"]
-            falta_firma = opciones["comprobar_firma"] and not v.get("firma") and p["origen"] in ORIGENES_EN_LOTE
-            if (opciones["verificar_antes"] and v.get("tipo") is None) or falta_firma:
-                self._poner_estado(p, "info", "Verificando…")
-                self._empezar_paso(prefijo, "Leyendo el manifiesto (winget show)…")
-                ok = yield from self._pasos_verificar(p, opciones["comprobar_firma"], estricto=p["grupo"] == "lote")
+            # 0. Si se está preparando en segundo plano, se espera a que acabe (la barra muestra su descarga)
+            if self._fondo_en == clave:
+                self._empezar_paso(prefijo, "Terminando de prepararlo (verificar y descargar)…")
+                self._siguiendo_fondo = True
+                while self._fondo_en == clave and not self._abortado:
+                    yield Pausa(0.5)
+                self._siguiendo_fondo = False
                 if self._abortado:
                     break
+
+            # 1. Verificación previa (si ya se hizo en segundo plano, se usa su resultado)
+            v = p["verif"]
+            preparado = self._preparados.get(clave) or {}
+            if preparado.get("verifico") or self._necesita_verificar(p, opciones):
+                if preparado.get("verifico"):
+                    ok = preparado["ok"]
+                else:
+                    self._poner_estado(p, "info", "Verificando…")
+                    self._empezar_paso(prefijo, "Leyendo el manifiesto (winget show)…")
+                    ok = yield from self._pasos_verificar(p, opciones["comprobar_firma"],
+                                                          estricto=p["grupo"] == "lote", guardar=True)
+                    if self._abortado:
+                        break
                 if not ok:
                     fila["tipo"], fila["texto"] = "omitido", f"No pasó la verificación: {v.get('texto')}"
                     fila["verificacion"] = v.get("texto") or ""
@@ -7355,8 +8075,9 @@ class PaginaActualizar(QWidget):
 
             # 2. ¿Está abierto? (el instalador fallaría o dejaría la actualización a medias)
             p.pop("abierto_por", None)
+            p.pop("finalizados", None)
             if opciones["avisar_abiertos"]:
-                respuesta = yield from self._revisar_abiertos(w, p, prefijo)
+                respuesta = yield from self._revisar_abiertos(w, p, prefijo, opciones["finalizar_abiertos"])
                 if self._abortado:
                     break
                 if respuesta == "omitir":
@@ -7390,14 +8111,22 @@ class PaginaActualizar(QWidget):
             args = self._args_actualizar(p, opciones)
             self.consola.agregar(f"▶ [{i}/{total}] {p['nombre']}: {p['instalada']} → {p['disponible']}", "titulo")
             self.consola.agregar(comando_visible(args), "suave")
+            guardado = p.get("descargado")
+            if guardado and os.path.isfile(guardado["ruta"]):
+                self.consola.agregar("⚡ Su instalador ya está descargado: winget lo usa sin volver a bajarlo si es el "
+                                     "que elige (antes comprueba otra vez su SHA256).", "suave")
             self._poner_estado(p, "info", "Actualizando…")
             self._empezar_paso(prefijo, f"Preparando {version_visible(p['instalada'])} → {p['disponible']}…",
                                instala=True)
             p["hash_winget"] = False
+            self._hubo_descarga = False
             self._en_curso = p
             limite = opciones["tiempo_max"] * 60 if opciones["tiempo_max"] else None
             r = yield self._winget(w, args, True, limite)
             self._en_curso = None
+            if guardado and p["hash_winget"] and not self._hubo_descarga:
+                fila["descarga_previa"] = True
+                self.consola.agregar("⚡ winget usó la descarga hecha por adelantado.", "ok")
             if r.codigo == 0x8A15005F and not (r.abortado or r.tiempo_agotado):
                 # Algunos instaladores (ej. Battle.net) piden la carpeta: se usa en la que ya está instalado
                 ubicacion = yield from self._ubicacion_instalada(w, p)
@@ -7449,6 +8178,9 @@ class PaginaActualizar(QWidget):
                     texto = f"No hay una actualización aplicable. {motivo}"
                 if p.get("abierto_por") and r.codigo in CODIGOS_PROGRAMA_ABIERTO:
                     texto += f" Estaba en uso por: {p['abierto_por']}."
+                if p.get("finalizados"):
+                    texto += f" (Antes se cerraron: {', '.join(p['finalizados'])}.)"
+                    fila["finalizados"] = list(p["finalizados"])
                 if fila.get("reintentos") and tipo in ("ok", "reinicio"):
                     texto += f" (a la {fila['reintentos'] + 1}.ª: antes chocó con otra instalación)"
                 salida_instalador = codigo_salida_instalador(r.texto) if tipo == "error" else None
@@ -7474,6 +8206,7 @@ class PaginaActualizar(QWidget):
                     self.consola.agregar("Se detiene: falló una actualización y la opción lo pide.", "aviso")
             if self._abortado:
                 break
+        self._parar_preparacion()
         for clave in claves:
             fila = reporte["filas"][clave]
             if fila["tipo"] == "pendiente":
@@ -7489,6 +8222,78 @@ class PaginaActualizar(QWidget):
         reporte["fin"] = time.strftime("%Y-%m-%d %H:%M:%S")
         if opciones["guardar_reporte"]:
             self._guardar_reporte(reporte)
+
+    @staticmethod
+    def _necesita_verificar(p: dict, opciones: dict) -> bool:
+        v = p["verif"]
+        falta_firma = opciones["comprobar_firma"] and not v.get("firma") and p["origen"] in ORIGENES_EN_LOTE
+        return bool((opciones["verificar_antes"] and v.get("tipo") is None) or falta_firma)
+
+    def _siguiente_a_preparar(self, claves: list[str], opciones: dict) -> str | None:
+        """El primero sin preparar de los que vienen (como mucho ADELANTO_PREPARACION por delante)."""
+        inicio = self._indice_instalando + 1
+        for clave in claves[inicio:inicio + ADELANTO_PREPARACION]:
+            if clave in self._preparados:
+                continue
+            p = self._paquetes.get(clave)
+            if p is None or p.get("id_cortado") or (p["verif"].get("tipo") == "error" and p["grupo"] == "lote") \
+                    or not (self._necesita_verificar(p, opciones) or self._vale_descargar(p)):
+                self._preparados[clave] = {"verifico": False, "ok": None}      # no hay nada que adelantar
+                continue
+            return clave
+        return None
+
+    def _flujo_preparar(self, claves: list[str], opciones: dict):
+        """
+        Segundo plano del lote: verifica y descarga los que vienen mientras se instala otro. No instala
+        ni pregunta nada (las preguntas y la instalación van en el flujo principal, de una en una).
+        """
+        w = self._seguridad["winget"]
+        while not (self._abortado or self._detener):
+            clave = self._siguiente_a_preparar(claves, opciones)
+            if clave is None:
+                if all(c in self._preparados for c in claves[self._indice_instalando + 1:]):
+                    return
+                yield Pausa(1)          # ya hay bastantes preparados: espera a que se instale el actual
+                continue
+            p = self._paquetes[clave]
+            verificar = self._necesita_verificar(p, opciones)
+            self._fondo_en, self._pct_fondo = clave, -1
+            terminado = False
+            try:
+                self._poner_estado(p, "info", "Preparando en segundo plano…")
+                self.consola.agregar(f"⇣ {p['nombre']}: se prepara en segundo plano ("
+                                     + ("verificar y descargar" if verificar else "descargar") + ").", "suave")
+                if verificar:
+                    ok = yield from self._pasos_verificar(p, opciones["comprobar_firma"], estricto=p["grupo"] == "lote",
+                                                          guardar=True, fondo=True)
+                else:
+                    yield from self._detalles_instalado(w, p)
+                    ok = yield from self._descargar_y_revisar(p, False, True, fondo=True)
+                terminado = not (self._abortado or self._carril.abortado)
+            finally:
+                self._fondo_en = None
+                if terminado:
+                    self._preparados[clave] = {"verifico": verificar, "ok": ok}
+                else:
+                    # Se cortó a medias: el flujo principal lo verificará entero
+                    self._preparados[clave] = {"verifico": False, "ok": None}
+                    if verificar:
+                        p["verif"].pop("tipo", None)
+                    if self._reporte and self._reporte["filas"].get(clave, {}).get("tipo") == "pendiente":
+                        self._poner_estado(p, "pendiente", "En cola")
+            listo = (["verificado"] if verificar else []) + (["descargado"] if p.get("descargado") else [])
+            if ok:
+                self._poner_estado(p, "pendiente", "En cola · " + " y ".join(listo) if listo else "En cola")
+            else:
+                self._poner_estado(p, "aviso", "En cola · no pasó la verificación (se omitirá)")
+
+    def _parar_preparacion(self):
+        """Corta el segundo plano y borra lo descargado por adelantado que winget no llegó a usar."""
+        self._carril.detener()
+        self._fondo_en, self._siguiendo_fondo = None, False
+        for p in self._paquetes.values():
+            borrar_guardado_winget(p.pop("descargado", None))
 
     def _ubicacion_instalada(self, w: str, p: dict):
         detalles = yield from self._detalles_instalado(w, p)
@@ -7569,12 +8374,16 @@ class PaginaActualizar(QWidget):
             yield Pausa(2)
         self.consola.agregar("Windows Installer quedó libre: se sigue.", "suave")
 
-    def _revisar_abiertos(self, w: str, p: dict, prefijo: str):
-        """Antes de instalar: qué programas tienen abiertos archivos de su carpeta. Devuelve «seguir» u «omitir»."""
+    def _revisar_abiertos(self, w: str, p: dict, prefijo: str, auto: bool = False):
+        """
+        Antes de instalar: qué programas tienen abiertos archivos de su carpeta. Devuelve «seguir» u «omitir».
+        auto: los finaliza sin preguntar (una sola vez: si queda alguno, de Windows o sin permiso, se sigue igual).
+        """
         detalles = yield from self._detalles_instalado(w, p)
         carpeta = detalles.get("carpeta")
         if not carpeta or self._abortado:
             return "seguir"
+        finalizo = False
         while True:
             self._empezar_paso(prefijo, "Revisando si el programa está abierto…")
             r = yield self._powershell(script_procesos_en(carpeta), 90)
@@ -7586,36 +8395,85 @@ class PaginaActualizar(QWidget):
                 return "seguir"
             grupos = agrupar_procesos(datos)
             if not grupos:
+                if finalizo:
+                    self.consola.agregar(f"✓ {p['nombre']} ya no está en uso: se sigue.", "ok")
+                p.pop("abierto_por", None)
                 return "seguir"
             p["abierto_por"] = ", ".join(n + (f" ({c} procesos)" if c > 1 else "") for n, c, _ in grupos)
             archivos = sorted({a for _, _, a in grupos if a})
             self.consola.agregar(f"⚠ {p['nombre']} está en uso por: {p['abierto_por']}"
                                  + (f" (tienen abierto {', '.join(archivos[:3])})" if archivos else "") + ".", "aviso")
-            if self.sin_dialogos:
+            finalizables, intocables = separar_finalizables(datos)
+            if auto and finalizables and not finalizo:
+                respuesta = "finalizar"
+            elif auto or self.sin_dialogos:
+                if intocables:
+                    self.consola.agregar("No se finalizan (son de Windows o servicios; el instalador se encarga): "
+                                         + ", ".join(n for n, _, _ in agrupar_procesos(intocables)) + ".", "suave")
                 return "seguir"
-            respuesta = self._preguntar_abiertos(p, grupos, carpeta)
+            else:
+                respuesta = self._preguntar_abiertos(p, carpeta, finalizables, intocables)
+            if respuesta == "finalizar":
+                yield from self._finalizar_procesos(p, finalizables, prefijo)
+                if self._abortado:
+                    return "omitir"
+                finalizo = True
+                continue
             if respuesta != "revisar":
                 return respuesta
 
-    def _preguntar_abiertos(self, p: dict, grupos: list, carpeta: str) -> str:
+    def _finalizar_procesos(self, p: dict, procesos: list, prefijo: str):
+        """Cierra (o finaliza) los procesos que tienen abierto el programa y dice cuáles no se pudo."""
+        nombres = ", ".join(n for n, _, _ in agrupar_procesos(procesos))
+        self.consola.agregar(f"⏹ {p['nombre']}: se cierran {nombres} (si no se cierran solos en 10 s, se "
+                             "finalizan)…", "aviso")
+        self._empezar_paso(prefijo, "Cerrando los programas que lo tienen abierto…")
+        r = yield self._powershell(script_finalizar_procesos(procesos), 120)
+        if r.abortado:
+            return
+        datos = r.datos if isinstance(r.datos, list) else [r.datos] if isinstance(r.datos, dict) else None
+        if datos is None:
+            self.consola.agregar("No se pudieron cerrar (PowerShell no respondió).", "aviso")
+            return
+        cerrados, fallos = resumir_finalizados(datos)
+        if cerrados:
+            self.consola.agregar("✓ Se cerraron: " + ", ".join(cerrados) + ".", "ok")
+            p.setdefault("finalizados", []).extend(cerrados)
+        if fallos:
+            self.consola.agregar("No se pudieron finalizar: " + "; ".join(fallos[:6])
+                                 + ("" if self.es_admin else ". Sin permisos de administrador no se pueden finalizar "
+                                                             "los que corren como administrador") + ".", "aviso")
+
+    def _preguntar_abiertos(self, p: dict, carpeta: str, finalizables: list, intocables: list) -> str:
         caja = QMessageBox(self)
         caja.setIcon(QMessageBox.Icon.Warning)
         caja.setWindowTitle(APP_NOMBRE)
-        lista = "\n".join(f"• {n}" + (f" ({c} procesos)" if c > 1 else "") + (f" — usa {a}" if a else "")
-                          for n, c, a in grupos[:12])
-        caja.setText(f"«{p['nombre']}» está en uso ahora mismo por:\n\n{lista}\n\nSi siguen abiertos, el instalador "
-                     "puede fallar («otra aplicación lo está usando») o dejar la actualización a medias.\n\n"
-                     "Ciérralos (guarda antes lo que tengas abierto) y pulsa «Ya los cerré».")
-        caja.setInformativeText(f"Carpeta revisada: {carpeta}"
-                                + ("" if self.es_admin else "\nSin permisos de administrador no se ven los programas "
-                                                            "que corren como administrador."))
+
+        def lineas(procesos: list, nota: str = "") -> list[str]:
+            return [f"• {n}" + (f" ({c} procesos)" if c > 1 else "") + (f" — usa {a}" if a else "") + nota
+                    for n, c, a in agrupar_procesos(procesos)]
+        lista = (lineas(finalizables) + lineas(intocables, " (de Windows: no se cierra)"))[:12]
+        caja.setText(f"«{p['nombre']}» está en uso ahora mismo por:\n\n" + "\n".join(lista) + "\n\nSi siguen "
+                     "abiertos, el instalador puede fallar («otra aplicación lo está usando») o dejar la actualización "
+                     "a medias.\n\nCiérralos tú (guarda antes lo que tengas abierto) y pulsa «Ya los cerré», o deja "
+                     "que la app los cierre.")
+        caja.setInformativeText(
+            ("«Finalizarlos y seguir»: se les pide cerrarse y, si siguen abiertos a los 10 s, se finalizan: "
+             "pierdes lo que no hayas guardado en ellos.\n" if finalizables else "")
+            + f"Carpeta revisada: {carpeta}"
+            + ("" if self.es_admin else "\nSin permisos de administrador no se ven ni se pueden finalizar los "
+                                        "programas que corren como administrador."))
         b_revisar = caja.addButton("Ya los cerré: revisar otra vez", QMessageBox.ButtonRole.AcceptRole)
+        b_finalizar = (caja.addButton("Finalizarlos y seguir", QMessageBox.ButtonRole.DestructiveRole)
+                       if finalizables else None)
         b_seguir = caja.addButton("Actualizar de todos modos", QMessageBox.ButtonRole.ActionRole)
         caja.addButton("Saltar este programa", QMessageBox.ButtonRole.RejectRole)
         caja.setDefaultButton(b_revisar)
         caja.exec()
         if caja.clickedButton() is b_revisar:
             return "revisar"
+        if b_finalizar is not None and caja.clickedButton() is b_finalizar:
+            return "finalizar"
         return "seguir" if caja.clickedButton() is b_seguir else "omitir"
 
     def _al_terminar_actualizacion(self):
@@ -7652,12 +8510,12 @@ class PaginaActualizar(QWidget):
                     self._copiar("conda update -n base --all", "Comando de conda copiado")
             return
         comando = comando_visible(self._args_actualizar(p))
+        opciones = self.opciones()
         if not self._confirmar_inicio(
                 f"«{p['nombre']}» ({p['id']})\nOrigen: {p['origen']} · {p['instalada']} → {p['disponible']}\n\n"
                 f"Motivo de la revisión manual:\n{p['motivo']}\n\nSe ejecutará:\n{comando}\n\n"
-                "Actualízalo solo si confías en este paquete."):
+                "Actualízalo solo si confías en este paquete.", self._aviso_finalizar(opciones)):
             return
-        opciones = self.opciones()
         opciones["verificar_antes"] = True
         self._iniciar_flujo(self._flujo_actualizar([clave], opciones), "actualizar", "Actualizando…",
                             al_terminar=self._al_terminar_actualizacion)
@@ -8113,6 +8971,7 @@ class PaginaActualizar(QWidget):
         marcadas = len(self._claves_marcadas()) if self._analizado else 0
         self.btn_analizar.setEnabled(libre and ES_WINDOWS)
         self.btn_admin.setEnabled(libre)
+        self.btn_store.setEnabled(libre)
         self.btn_opciones.setEnabled(libre)
         self.btn_actualizar.setEnabled(libre and seguro and marcadas > 0)
         self.btn_actualizar.setText(f"Actualizar seleccionadas ({marcadas})" if marcadas else "Actualizar seleccionadas")
@@ -8126,6 +8985,66 @@ class PaginaActualizar(QWidget):
         self.btn_manual_copiar.setEnabled(hay_manual)
         self.btn_detener.setEnabled(not libre and self._modo_flujo == "actualizar" and not self._detener)
         self.btn_cancelar.setEnabled(not libre)
+
+    def _cambiar_pinning_store(self):
+        """Activa o quita BypassCertificatePinningForMicrosoftStore (opción de administrador de winget)."""
+        seg = self._seguridad or {}
+        if self._flujo is not None or not seg.get("winget"):
+            return
+        activar = not seg.get("sin_pinning_store")
+        args = ["settings", "--enable" if activar else "--disable", AJUSTE_PINNING_STORE]
+        if not self.sin_dialogos:
+            caja = QMessageBox(self)
+            caja.setWindowTitle(APP_NOMBRE)
+            if not self.es_admin:
+                caja.setIcon(QMessageBox.Icon.Information)
+                caja.setText("Es una opción de administrador de winget: abre la app como administrador y vuelve a "
+                             "pulsar el botón.\n\nO, en una terminal como administrador:\nwinget " + " ".join(args))
+                b_admin = caja.addButton("Reabrir como administrador", QMessageBox.ButtonRole.AcceptRole)
+                caja.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+                caja.exec()
+                if caja.clickedButton() is b_admin:
+                    self._reabrir_admin()
+                return
+            quien = seg.get("https_interceptado") or "tu antivirus"
+            if activar:
+                caja.setIcon(QMessageBox.Icon.Warning)
+                caja.setText(f"winget dejará de exigir el certificado propio de Microsoft para la Microsoft Store "
+                             f"(«{AJUSTE_PINNING_STORE}»). Seguirá comprobando que Windows confíe en el certificado, "
+                             f"que ahora es el de {quien}.\n\nAsí vuelven a salir y a actualizarse las apps de la "
+                             "Store, pero si alguien suplantara la Store con un certificado que tu equipo acepte, "
+                             "winget ya no lo notaría. El repositorio winget no cambia: su catálogo va firmado y "
+                             "cada instalador se comprueba con su SHA256.")
+                caja.setInformativeText("Se puede revertir con el mismo botón. Es lo mismo que ejecutar, como "
+                                        "administrador: winget " + " ".join(args))
+                b_si = caja.addButton("Permitirlo", QMessageBox.ButtonRole.AcceptRole)
+            else:
+                caja.setIcon(QMessageBox.Icon.Question)
+                caja.setText("winget volverá a exigir el certificado de Microsoft para la Store "
+                             f"(«{AJUSTE_PINNING_STORE}» desactivado)."
+                             + (f"\n\nComo {quien} sigue inspeccionando tu HTTPS, la Store volverá a dar el error "
+                                "0x8A15005E." if seg.get("https_interceptado") else ""))
+                b_si = caja.addButton("Volver a exigirlo", QMessageBox.ButtonRole.AcceptRole)
+            caja.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+            caja.exec()
+            if caja.clickedButton() is not b_si:
+                return
+        elif not self.es_admin:
+            return
+
+        def flujo():
+            self.consola.agregar("▶ " + comando_visible(args), "titulo")
+            r = yield self._winget(seg["winget"], args, True, 60)
+            if r.abortado:
+                return
+            if r.codigo == 0:
+                self.consola.agregar(f"✓ «{AJUSTE_PINNING_STORE}» " + ("activado" if activar else "desactivado")
+                                     + ": se vuelve a buscar para leerlo y ver la Store.", "ok")
+            else:
+                self.salio_bien = False
+                self.consola.agregar(f"winget no pudo cambiar el ajuste ({codigo_hex(r.codigo)}).", "error")
+        self._iniciar_flujo(flujo(), "ajuste", "Cambiando el ajuste de winget…",
+                            al_terminar=lambda: self.salio_bien and self.analizar(False))
 
     def _copiar_comando_manual(self):
         p = self._paquetes.get(self._clave_seleccionada(self.tabla_manual) or "")
@@ -8142,6 +9061,12 @@ class PaginaActualizar(QWidget):
                         sub.widget().deleteLater()
             if item.widget():
                 item.widget().deleteLater()
+        sin_pinning = bool(seg and seg.get("sin_pinning_store"))
+        self.btn_store.setVisible(bool(seg and seg.get("winget") and (seg.get("https_interceptado") or sin_pinning)))
+        self.btn_store.setText("Volver a exigir el certificado de la Store…" if sin_pinning
+                               else "Permitir la Store con la inspección HTTPS…")
+        self.btn_store.setToolTip(f"winget settings --{'disable' if sin_pinning else 'enable'} {AJUSTE_PINNING_STORE}"
+                                  " (necesita administrador)")
         if seg is None:
             self.caja_seguridad.addWidget(etiqueta("Se revisa al buscar actualizaciones.", "suave"))
             return
@@ -8271,6 +9196,690 @@ class PaginaActualizar(QWidget):
 # 7. ACERCA DE
 # ═════════════════════════════════════════════════════════════════════════════
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ACTUALIZAR LA APP (releases de GitHub)
+# ═════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_ACTUALIZAR_APP = {
+    "buscar_al_abrir": True,
+    "ultima_revision": 0.0,     # time.time() de la última vez que GitHub respondió
+    "etag": "",                 # con él, GitHub responde 304 si nada cambió (y no gasta de su límite)
+    "release": None,            # lo último que se leyó de GitHub (ver leer_release)
+    "omitida": "",              # versión de la que pediste no volver a avisar
+}
+INTERVALO_REVISION_APP = 24 * 3600
+ESPERA_REVISION_AL_ABRIR = 4000         # ms: que la ventana ya esté lista antes de consultar
+RE_VERSION_RELEASE = re.compile(r"\d[\w.+-]*")
+RE_INSTALADOR_APP = re.compile(rf"^{APP_ID}_Setup_v?(\d[\w.]*)\.exe$", re.I)
+HOSTS_DESCARGA_APP = ("github.com", "githubusercontent.com")
+CARPETA_DESCARGA_APP = CARPETA_DATOS / "actualizacion"
+ARG_ACTUALIZACION = "--actualizacion="  # «--actualizacion=1.4.0:0»: el ayudante la volvió a abrir tras instalar
+VARIABLE_RELEASE_PRUEBA = "UTILIDADES_RELEASE_URL"     # pruebas: un JSON local en vez de la API de GitHub
+
+# Cómo terminó el instalador: códigos de salida de Inno Setup y los del ayudante («hash», «falta», «inicio»)
+CODIGOS_INSTALADOR = {
+    "1": "el instalador no pudo arrancar (o no se dio el permiso de administrador)",
+    "2": "se canceló antes de instalar",
+    "3": "el instalador falló al prepararse",
+    "4": "el instalador falló a mitad de la instalación",
+    "5": "se canceló a mitad de la instalación",
+    "7": "el instalador no pudo seguir (algún programa tenía sus archivos en uso)",
+    "8": "Windows necesita reiniciarse antes de instalar",
+    "hash": "el instalador cambió después de descargarlo (su SHA256 ya no coincidía) y no se abrió",
+    "falta": "el instalador descargado ya no estaba (¿lo puso en cuarentena el antivirus?)",
+    "inicio": "Windows o el antivirus no dejaron abrir el instalador",
+}
+
+
+def repo_de_github() -> str:
+    """«dueño/repositorio» de APP_REPO."""
+    return APP_REPO.rstrip("/").split("github.com/", 1)[-1]
+
+
+def url_ultima_release() -> str:
+    return os.environ.get(VARIABLE_RELEASE_PRUEBA) or f"https://api.github.com/repos/{repo_de_github()}/releases/latest"
+
+
+def comparar_versiones(a: str | None, b: str | None) -> int | None:
+    """-1, 0 o 1 según «a» sea menor, igual o mayor que «b» (1.3 = 1.3.0). None si alguna no se entiende."""
+    x, y = numeros_de_version(a), numeros_de_version(b)
+    if x is None or y is None:
+        return None
+    n = max(len(x), len(y))
+    x, y = x + [0] * (n - len(x)), y + [0] * (n - len(y))
+    return (x > y) - (x < y)
+
+
+def fecha_legible(marca: float) -> str:
+    """«hoy 21:55», «ayer 09:10» o «2026-10-28 09:10»."""
+    import datetime
+    d = datetime.datetime.fromtimestamp(marca)
+    dia = {0: "hoy", 1: "ayer"}.get((datetime.date.today() - d.date()).days, f"{d:%Y-%m-%d}")
+    return f"{dia} {d:%H:%M}"
+
+
+def leer_release(datos: dict) -> dict | None:
+    """
+    Lo que la app usa de una release de GitHub: versión, notas, página y el instalador con su tamaño y el
+    SHA256 que publica GitHub. None si es borrador, prerelease o su etiqueta no es una versión.
+    """
+    if not isinstance(datos, dict) or datos.get("draft") or datos.get("prerelease"):
+        return None
+    version = str(datos.get("tag_name") or "").strip().lstrip("vV")
+    if not RE_VERSION_RELEASE.fullmatch(version):
+        return None
+    instalador = None
+    for a in datos.get("assets") or []:
+        m = RE_INSTALADOR_APP.match(str(a.get("name") or ""))
+        if not m or not a.get("browser_download_url"):
+            continue
+        sha = str(a.get("digest") or "").lower().removeprefix("sha256:")
+        candidato = {"nombre": a["name"], "url": str(a["browser_download_url"]), "tamano": int(a.get("size") or 0),
+                     "sha256": sha if re.fullmatch(r"[0-9a-f]{64}", sha) else None}
+        if instalador is None or comparar_versiones(m.group(1), version) == 0:
+            instalador = candidato
+    return {"version": version, "titulo": str(datos.get("name") or f"v{version}"),
+            "notas": str(datos.get("body") or ""), "fecha": str(datos.get("published_at") or "")[:10],
+            "pagina": str(datos.get("html_url") or f"{APP_REPO}/releases"), "instalador": instalador}
+
+
+def consultar_ultima_release(etag: str = "") -> dict:
+    """
+    La última release publicada (corre en otro hilo): {"codigo", "release", "etag"}. Código 304 = nada
+    cambió desde la consulta de ese etag; 404 = el repositorio aún no tiene releases.
+    """
+    import urllib.error
+    import urllib.request
+    cabeceras = {"Accept": "application/vnd.github+json", "User-Agent": f"{APP_ID}/{APP_VERSION}"}
+    if etag:
+        cabeceras["If-None-Match"] = etag
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url_ultima_release(), headers=cabeceras), timeout=10) as r:
+            datos = json.loads(r.read().decode("utf-8"))
+            return {"codigo": 200, "release": leer_release(datos), "etag": r.headers.get("ETag") or ""}
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return {"codigo": 304, "release": None, "etag": etag}
+        if e.code == 404:
+            return {"codigo": 404, "release": None, "etag": ""}
+        if e.code in (403, 429):
+            raise RuntimeError("GitHub limitó las consultas desde tu conexión; se reintenta más tarde") from None
+        raise
+
+
+def describir_error_red(e: Exception) -> str:
+    import socket
+    import ssl
+    import urllib.error
+    motivo = e.reason if isinstance(e, urllib.error.URLError) and not isinstance(e, urllib.error.HTTPError) else e
+    if isinstance(motivo, TimeoutError):
+        return "GitHub tardó demasiado en responder"
+    if isinstance(motivo, ssl.SSLError):
+        return f"falló la conexión segura con GitHub (¿un antivirus revisa HTTPS?): {motivo}"
+    if isinstance(motivo, (socket.gaierror, ConnectionError)):
+        return "sin conexión a internet (o GitHub no responde)"
+    if isinstance(e, urllib.error.HTTPError):
+        return f"GitHub respondió {e.code} {e.reason}"
+    return str(e) if isinstance(e, (RuntimeError, ValueError)) else f"{type(e).__name__}: {e}"
+
+
+def host_permitido(url: str) -> bool:
+    """El instalador solo se baja de GitHub (github.com y sus servidores de descargas, siempre por HTTPS)."""
+    p = urllib.parse.urlparse(url)
+    if p.scheme == "file":
+        return bool(os.environ.get(VARIABLE_RELEASE_PRUEBA))        # solo en las pruebas
+    host = (p.hostname or "").lower()
+    return p.scheme == "https" and any(host == h or host.endswith("." + h) for h in HOSTS_DESCARGA_APP)
+
+
+def instalada_con_instalador() -> bool:
+    """La app corre desde donde la dejó su instalador de Inno Setup (que pone ahí unins000.exe)."""
+    return forma_de_ejecucion() == "PyInstaller" and (carpeta_app() / "unins000.exe").is_file()
+
+
+def control_inteligente_activo() -> bool:
+    """El Control inteligente de aplicaciones de Windows 11, activado: bloquea programas sin firma reconocida."""
+    if not ES_WINDOWS:
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\CI\Policy") as k:
+            return winreg.QueryValueEx(k, "VerifiedAndReputablePolicyState")[0] == 1
+    except OSError:
+        return False
+
+
+def script_firmas(rutas: list[str]) -> str:
+    """Estado, firmante y huella del certificado de cada archivo (Get-AuthenticodeSignature)."""
+    return ("$r = @(foreach ($f in @(" + ", ".join(ps_texto(x) for x in rutas) + ")) { "
+            "$s = Get-AuthenticodeSignature -LiteralPath $f; [ordered]@{ Estado = [string]$s.Status; "
+            "Firmante = if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { $null }; "
+            "Huella = if ($s.SignerCertificate) { $s.SignerCertificate.Thumbprint } else { $null } } }); "
+            "'" + MARCA_JSON + "' + (ConvertTo-Json -InputObject $r -Compress)")
+
+
+def descargar_instalador_app(t: Tarea, instalador: dict, carpeta: Path) -> dict:
+    """
+    Descarga el instalador de la versión nueva (en otro hilo) y lo comprueba: que venga de GitHub, su tamaño,
+    el SHA256 que publica GitHub y su firma digital (junto con la de esta versión, para compararlas). Se baja
+    a un .part que solo se renombra si todo coincide. Devuelve {"ruta", "sha256", "firmas"}.
+    """
+    import hashlib
+    import urllib.request
+    sha_esperado = str(instalador.get("sha256") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", sha_esperado):
+        raise ValueError("GitHub no publicó el SHA256 de este instalador: sin él no se puede comprobar")
+    if not host_permitido(instalador.get("url") or ""):
+        raise ValueError(f"El enlace del instalador no es de GitHub: {instalador.get('url')}")
+    carpeta.mkdir(parents=True, exist_ok=True)
+    for viejo in carpeta.iterdir():             # lo de otras veces: descargas a medias o versiones viejas
+        if viejo.is_file():
+            try:
+                viejo.unlink()
+            except OSError:
+                pass
+    destino = carpeta / instalador["nombre"]
+    parcial = destino.with_name(destino.name + ".part")
+    esperado = int(instalador.get("tamano") or 0)
+    h, hecho = hashlib.sha256(), 0
+    try:
+        pedido = urllib.request.Request(instalador["url"], headers={"User-Agent": f"{APP_ID}/{APP_VERSION}"})
+        with urllib.request.urlopen(pedido, timeout=30) as r, open(parcial, "wb") as fh:
+            if not host_permitido(r.geturl()):
+                raise ValueError(f"La descarga se desvió a un sitio que no es de GitHub ({dominio(r.geturl())})")
+            total = esperado or int(r.headers.get("Content-Length") or 0)
+            while True:
+                t.revisar()
+                bloque = r.read(1 << 17)
+                if not bloque:
+                    break
+                fh.write(bloque)
+                h.update(bloque)
+                hecho += len(bloque)
+                t.progreso(hecho, total, f"Descargando… {formatear_bytes(hecho)}"
+                                         + (f" de {formatear_bytes(total)}" if total else ""))
+        if esperado and hecho != esperado:
+            raise ValueError(f"Se descargaron {hecho:,} bytes y GitHub dice {esperado:,}: la descarga quedó incompleta")
+        if h.hexdigest() != sha_esperado:
+            raise ValueError("El SHA256 de lo descargado no coincide con el que publica GitHub (se borró)")
+        os.replace(parcial, destino)
+    finally:
+        if parcial.exists():
+            try:
+                parcial.unlink()
+            except OSError:
+                pass
+    t.progreso(0, 0, "Revisando la firma digital…")
+    rutas = [str(destino)] + ([sys.executable] if forma_de_ejecucion() == "PyInstaller" else [])
+    firmas = None
+    try:
+        programa, args = comando_powershell(script_firmas(rutas))
+        salida = ejecutar_cancelable(t, [programa] + args, timeout=90, env=entorno_powershell()).stdout
+        linea = next((x for x in salida.splitlines() if x.startswith(MARCA_JSON)), None)
+        firmas = json.loads(linea[len(MARCA_JSON):]) if linea else None
+    except Cancelado:
+        raise
+    except Exception:
+        pass
+    return {"ruta": str(destino), "sha256": sha_esperado, "firmas": firmas if isinstance(firmas, list) else None}
+
+
+def evaluar_firma_instalador(firmas: list | None) -> tuple[str, str]:
+    """
+    (tipo, texto) de la firma del instalador, comparada con la de esta versión (si está compilada).
+    «error» = no se instala: lo alteraron después de firmarlo, o tu versión está firmada y él no lo está
+    con el mismo certificado.
+    """
+    if not firmas:
+        return "aviso", "No se pudo revisar la firma digital (PowerShell no respondió); el SHA256 sí coincide."
+    inst = firmas[0] or {}
+    actual = (firmas[1] or {}) if len(firmas) > 1 else None
+    nombre = nombre_del_certificado(inst.get("Firmante"))
+    if inst.get("Estado") == "HashMismatch":
+        return "error", "La firma digital del instalador no corresponde a su contenido: lo modificaron después de firmarlo."
+    if actual and actual.get("Huella"):
+        if inst.get("Huella") == actual["Huella"]:
+            return "ok", f"Firmado con el mismo certificado que tu versión ({nombre})."
+        return "error", (f"Tu versión está firmada por {nombre_del_certificado(actual.get('Firmante'))} y el "
+                         "instalador " + (f"por otro certificado ({nombre})." if inst.get("Huella") else "no tiene firma."))
+    if inst.get("Estado") == "Valid":
+        return "ok", f"Firma digital válida: {nombre}."
+    if inst.get("Huella"):
+        return "info", f"Firmado por {nombre}, con un certificado que Windows no reconoce ({inst.get('Estado')})."
+    return "info", "Sin firma digital" + (", igual que tu versión actual." if actual is not None else ".")
+
+
+def argumentos_instalador(silencioso: bool, registro: Path) -> str:
+    """
+    Parámetros de Inno Setup. /SILENT: sin preguntas, solo la ventana de progreso, en la misma carpeta y con
+    las opciones de la instalación anterior. /CLOSEAPPLICATIONS por si la app aún no terminó de cerrarse, y
+    /NORESTARTAPPLICATIONS porque la vuelve a abrir el ayudante (si no, se abriría dos veces).
+    """
+    args = (["/SILENT", "/SUPPRESSMSGBOXES", "/CLOSEAPPLICATIONS", "/NORESTARTAPPLICATIONS"] if silencioso else [])
+    return " ".join(args + ["/SP-", "/NORESTART", f'/LOG="{registro}"'])
+
+
+def script_ayudante_actualizar(instalador: str, sha256: str, argumentos: str, pid: int, app: str,
+                               version: str, silencioso: bool) -> str:
+    """
+    El PowerShell aparte (sin ventana) que sigue vivo cuando la app se cierra: espera a que se cierre,
+    vuelve a comprobar el SHA256 justo antes de abrir el instalador (Inno Setup pide el permiso de
+    administrador) y al terminar vuelve a abrir la app con tus permisos normales, diciéndole cómo fue
+    («--actualizacion=versión:código»). Con el asistente, si terminó bien, la abre el propio instalador.
+    """
+    return (f"try {{ Wait-Process -Id {int(pid)} -Timeout 60 -ErrorAction Stop }} catch {{ }}; "
+            f"$f = {ps_texto(instalador)}; $codigo = 'inicio'; "
+            f"try {{ if (-not (Test-Path -LiteralPath $f)) {{ $codigo = 'falta' }} "
+            f"elseif ((Get-FileHash -LiteralPath $f -Algorithm SHA256 -ErrorAction Stop).Hash -ne "
+            f"{ps_texto(sha256.upper())}) {{ $codigo = 'hash' }} "
+            f"else {{ $p = Start-Process -FilePath $f -ArgumentList {ps_texto(argumentos)} -PassThru -Wait; "
+            f"$codigo = [string]$p.ExitCode }} }} catch {{ }}; "
+            f"if ({'$true' if silencioso else '$false'} -or $codigo -ne '0') {{ Start-Process -FilePath {ps_texto(app)} "
+            f"-ArgumentList ({ps_texto(f'{ARG_ACTUALIZACION}{version}:')} + $codigo) }}")
+
+
+def lanzar_ayudante_actualizar(script: str) -> str | None:
+    """Arranca el ayudante sin ventana y separado de la app (sigue vivo al cerrarla). None = arrancó."""
+    programa, args = comando_powershell(script)
+    flags = FLAGS_SIN_VENTANA | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    error: OSError | None = None
+    # Fuera del «job» de la app si se puede (si la abrió otro programa que cierra todo lo suyo al salir)
+    for separar in (getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0), 0):
+        try:
+            CARPETA_DESCARGA_APP.mkdir(parents=True, exist_ok=True)     # el ayudante no se queda en la de la app
+            subprocess.Popen([programa] + args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, creationflags=flags | separar, env=entorno_powershell(),
+                             cwd=str(CARPETA_DESCARGA_APP))
+            return None
+        except OSError as e:
+            error = e
+    return f"{type(error).__name__}: {error}"
+
+
+def resultado_de_actualizacion(argv: list[str]) -> tuple[str, str] | None:
+    """(versión que se instalaba, código) si el ayudante volvió a abrir la app tras el instalador."""
+    for a in argv:
+        if a.startswith(ARG_ACTUALIZACION):
+            version, _, codigo = a[len(ARG_ACTUALIZACION):].partition(":")
+            return version, codigo
+    return None
+
+
+class ActualizadorApp(QObject):
+    """
+    ¿Hay una versión nueva de la app en GitHub? Se consulta al abrir (si está activado y pasó un día desde
+    la última vez) o con «Buscar ahora»: una sola consulta pequeña, en otro hilo y con ETag (si nada cambió,
+    GitHub responde 304 y no gasta de su límite de 60 por hora). Sin internet no dice nada al abrir.
+    """
+    cambio = pyqtSignal()
+    _respuesta = pyqtSignal(object)
+
+    def __init__(self, config: Config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.cfg = config.seccion("actualizar_app")
+        for clave, valor in DEFAULT_ACTUALIZAR_APP.items():
+            self.cfg.setdefault(clave, copy.deepcopy(valor))
+        self.buscando = False
+        self.error = ""
+        self.pospuesta = False          # «Más tarde»: no vuelve a avisar en esta sesión
+        self._respuesta.connect(self._recibir)
+
+    def release(self) -> dict | None:
+        """La última release que se leyó de GitHub (aunque no sea más nueva)."""
+        r = self.cfg.get("release")
+        return r if isinstance(r, dict) and numeros_de_version(r.get("version")) else None
+
+    def nueva(self) -> dict | None:
+        """La release de GitHub, si es más nueva que esta versión."""
+        r = self.release()
+        return r if r and comparar_versiones(r["version"], APP_VERSION) == 1 else None
+
+    def debe_avisar(self) -> bool:
+        r = self.nueva()
+        return r is not None and not self.pospuesta and r["version"] != self.cfg.get("omitida")
+
+    def al_abrir(self):
+        """Avisa con lo que ya se sabía y, si toca, consulta GitHub unos segundos después (sin trabar nada)."""
+        self.cambio.emit()
+        transcurrido = time.time() - float(self.cfg.get("ultima_revision") or 0)
+        if self.cfg.get("buscar_al_abrir") and not 0 <= transcurrido < INTERVALO_REVISION_APP:
+            QTimer.singleShot(ESPERA_REVISION_AL_ABRIR, self.buscar)
+
+    def buscar(self):
+        if self.buscando:
+            return
+        self.buscando, self.error = True, ""
+        self.cambio.emit()
+        etag = str(self.cfg.get("etag") or "")
+
+        def trabajar():
+            try:
+                r = consultar_ultima_release(etag)
+            except Exception as e:
+                r = {"error": describir_error_red(e)}
+            try:
+                self._respuesta.emit(r)
+            except RuntimeError:            # la app ya se cerró
+                pass
+        threading.Thread(target=trabajar, daemon=True, name="buscar_version_app").start()
+
+    def _recibir(self, r: dict):
+        self.buscando = False
+        if "error" in r:
+            self.error = r["error"]
+        else:
+            self.cfg["ultima_revision"] = time.time()
+            if r["codigo"] != 304:
+                self.cfg["release"], self.cfg["etag"] = r["release"], r["etag"]
+            self.config.guardar()
+        self.cambio.emit()
+
+    def cambiar_buscar_al_abrir(self, activo: bool):
+        self.cfg["buscar_al_abrir"] = bool(activo)
+        self.config.guardar()
+
+    def posponer(self):
+        self.pospuesta = True
+        self.cambio.emit()
+
+    def omitir(self):
+        r = self.nueva()
+        if r is not None:
+            self.cfg["omitida"] = r["version"]
+            self.config.guardar()
+        self.cambio.emit()
+
+    def texto_estado(self) -> tuple[str, str]:
+        """(texto, clase del QLabel) para «Acerca de»."""
+        if self.buscando:
+            return "Buscando en GitHub…", "suave"
+        cuando = float(self.cfg.get("ultima_revision") or 0)
+        revisado = f" Revisado: {fecha_legible(cuando)}." if cuando else ""
+        if self.error:
+            return f"No se pudo revisar: {self.error}.{revisado}", "aviso"
+        r = self.nueva()
+        if r is not None:
+            omitida = " (pediste no avisar de esta)" if r["version"] == self.cfg.get("omitida") else ""
+            return f"Hay una versión nueva: {r['version']}{omitida}. Tienes la {APP_VERSION}.{revisado}", "ok"
+        if not cuando:
+            return "Aún no se ha revisado.", "suave"
+        ultima = self.release()
+        if ultima is None:
+            return f"Aún no hay versiones publicadas en GitHub.{revisado}", "suave"
+        if comparar_versiones(APP_VERSION, ultima["version"]) == 1:
+            return (f"Tienes la {APP_VERSION}, más nueva que la última publicada en GitHub "
+                    f"({ultima['version']}).{revisado}"), "suave"
+        return f"Tienes la versión más reciente ({APP_VERSION}).{revisado}", "suave"
+
+
+class AvisoApp(QFrame):
+    """Franja bajo la barra superior: hay una versión nueva, o cómo terminó la actualización."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("avisoApp")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(SPACING_LG, SPACING_SM, SPACING_LG, SPACING_SM)
+        h.setSpacing(SPACING_SM)
+        self.lbl = QLabel()
+        self.lbl.setWordWrap(True)
+        self.lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        h.addWidget(self.lbl, 1)
+        self._botones = QHBoxLayout()
+        self._botones.setSpacing(SPACING_SM)
+        h.addLayout(self._botones)
+        self.tipo = ""
+        self.hide()
+
+    def mostrar(self, texto: str, tipo: str, botones: list[tuple]):
+        """tipo: «info» (versión nueva), «ok» o «aviso». botones: [(texto, clase, al pulsar)]."""
+        self.tipo = tipo
+        self.setProperty("tipo", tipo)
+        refrescar_estilo(self)
+        refrescar_estilo(self.lbl)
+        self.lbl.setText(texto)
+        while self._botones.count():
+            w = self._botones.takeAt(0).widget()
+            if w is not None:
+                w.hide()            # deleteLater no lo quita hasta volver al bucle de eventos
+                w.deleteLater()
+        for nombre, clase, accion in botones:
+            b = boton(nombre, clase)
+            b.clicked.connect(accion)
+            self._botones.addWidget(b)
+        self.show()
+
+    def ocultar(self):
+        self.tipo = ""
+        self.hide()
+
+
+def navegador_notas(release: dict) -> QTextBrowser:
+    """Las notas de una release (Markdown de GitHub) con sus enlaces."""
+    notas = QTextBrowser()
+    notas.setObjectName("notasRelease")
+    notas.setOpenExternalLinks(True)
+    notas.setMarkdown(release.get("notas") or "_Esta versión no trae notas._")
+    return notas
+
+
+def ver_novedades(parent: QWidget, release: dict):
+    d = QDialog(parent)
+    d.setWindowTitle(f"Novedades de la versión {release['version']}")
+    v = QVBoxLayout(d)
+    v.setContentsMargins(SPACING_LG, SPACING_LG, SPACING_LG, SPACING_LG)
+    v.setSpacing(SPACING_MD)
+    t = QLabel(f"{APP_NOMBRE} {release['version']}")
+    t.setProperty("class", "titulo-pagina")
+    v.addWidget(t)
+    v.addWidget(navegador_notas(release), 1)
+    fila = QHBoxLayout()
+    fila.addStretch(1)
+    b = boton("Cerrar", "primario")
+    b.clicked.connect(d.accept)
+    fila.addWidget(b)
+    v.addLayout(fila)
+    d.resize(720, 560)
+    d.exec()
+
+
+class DialogoActualizarApp(QDialog):
+    """
+    Novedades de la versión nueva y cómo instalarla: descarga el instalador de GitHub, lo comprueba
+    (tamaño, SHA256 y firma) y deja un ayudante instalándolo mientras la app se cierra.
+    """
+
+    def __init__(self, ventana, release: dict):
+        super().__init__(ventana)
+        self.ventana, self.release = ventana, release
+        self.tarea: Tarea | None = None
+        self.setWindowTitle(f"Actualizar a la versión {release['version']}")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(SPACING_LG, SPACING_LG, SPACING_LG, SPACING_LG)
+        v.setSpacing(SPACING_MD)
+        t = QLabel(f"{APP_NOMBRE} {release['version']}")
+        t.setProperty("class", "titulo-pagina")
+        v.addWidget(t)
+        inst = release.get("instalador") or {}
+        datos = [f"Tienes la {APP_VERSION}"]
+        if release.get("fecha"):
+            datos.append(f"publicada el {release['fecha']}")
+        if inst.get("tamano"):
+            datos.append(f"instalador de {formatear_bytes(inst['tamano'])}")
+        v.addWidget(etiqueta(" · ".join(datos), "suave"))
+        v.addWidget(etiqueta("NOVEDADES"))
+        v.addWidget(navegador_notas(release), 1)
+
+        # Cómo se instala: sola solo si esta copia la dejó su instalador y GitHub publica el SHA256
+        self.instalable = False
+        self.rb_sola = self.rb_asistente = self.btn_instalar = None
+        if not instalada_con_instalador():
+            motivo = ("corre desde el código fuente" if forma_de_ejecucion() == "Código fuente"
+                      else "no se instaló con su instalador (es un .exe suelto)")
+            v.addWidget(etiqueta(f"Esta copia {motivo}: descarga la versión nueva desde su página de GitHub.", "aviso"))
+        elif not inst:
+            v.addWidget(etiqueta("Esta versión no trae el instalador en GitHub: revísala en su página.", "aviso"))
+        elif not inst.get("sha256"):
+            v.addWidget(etiqueta("GitHub no publicó el SHA256 de este instalador y sin él no se instala sola: "
+                                 "descárgalo desde su página.", "aviso"))
+        else:
+            self.instalable = True
+            self.rb_sola = QRadioButton("Instalar sola (recomendado)")
+            self.rb_asistente = QRadioButton("Con el asistente del instalador")
+            grupo = QButtonGroup(self)
+            for rb in (self.rb_sola, self.rb_asistente):
+                grupo.addButton(rb)
+            self.rb_sola.setChecked(True)
+            explicaciones = (
+                (self.rb_sola, "La app se cierra, Windows pide permiso de administrador una vez (se instala en Archivos "
+                               "de programa) y se instala sin preguntas, en la misma carpeta y con tus mismas opciones. "
+                               "Al terminar, la app se vuelve a abrir sola. Instalar implica aceptar el contrato de "
+                               "licencia (EULA) de la versión nueva, que queda en la carpeta de la app."),
+                (self.rb_asistente, "Ves cada paso: contrato, carpeta y accesos directos. Al final, el instalador "
+                                    "ofrece abrir la app."))
+            for rb, texto in explicaciones:
+                v.addWidget(rb)
+                lbl = etiqueta(texto, "suave")
+                lbl.setContentsMargins(SPACING_LG, 0, 0, 0)
+                v.addWidget(lbl)
+            if control_inteligente_activo():
+                v.addWidget(etiqueta("El Control inteligente de aplicaciones de Windows está activado: bloquea los "
+                                     "instaladores que no tienen una firma reconocida.", "aviso"))
+
+        self.barra = QProgressBar()
+        self.barra.setTextVisible(False)
+        self.barra.hide()
+        v.addWidget(self.barra)
+        self.lbl_estado = etiqueta("", "suave")
+        self.lbl_estado.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_estado.hide()
+        v.addWidget(self.lbl_estado)
+
+        fila = QHBoxLayout()
+        fila.setSpacing(SPACING_SM)
+        pagina = release.get("pagina") or f"{APP_REPO}/releases"
+        b = boton("Ver en GitHub", None if self.instalable else "primario", pagina)
+        b.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(pagina)))
+        fila.addWidget(b)
+        fila.addStretch(1)
+        self.btn_cerrar = boton("Cerrar")
+        self.btn_cerrar.clicked.connect(self.reject)
+        fila.addWidget(self.btn_cerrar)
+        if self.instalable:
+            self.btn_instalar = boton("Descargar e instalar", "primario")
+            self.btn_instalar.clicked.connect(self._descargar)
+            fila.addWidget(self.btn_instalar)
+        v.addLayout(fila)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(100)
+        self._timer.timeout.connect(self._drenar)
+        pantalla = (ventana.screen() or QApplication.primaryScreen()).availableGeometry()
+        self.resize(min(760, int(pantalla.width() * 0.95)), min(700, int(pantalla.height() * 0.9)))
+
+    def _estado(self, texto: str, clase: str):
+        self.lbl_estado.setText(texto)
+        self.lbl_estado.setProperty("class", clase)
+        refrescar_estilo(self.lbl_estado)
+        self.lbl_estado.show()
+
+    def _activar(self, activo: bool):
+        for w in (self.rb_sola, self.rb_asistente, self.btn_instalar):
+            w.setEnabled(activo)
+        self.btn_cerrar.setText("Cerrar" if activo else "Cancelar")
+
+    def _descargar(self):
+        ocupadas = self.ventana.tareas_en_curso()
+        if ocupadas:
+            QMessageBox.information(self, APP_NOMBRE, "Para instalar, la app se cierra: espera a que termine lo que "
+                                                      f"está en curso ({', '.join(ocupadas)}).")
+            return
+        self._activar(False)
+        self.barra.setRange(0, 0)
+        self.barra.show()
+        self._estado("Conectando con GitHub…", "suave")
+        self.tarea = Tarea(descargar_instalador_app, self.release["instalador"], CARPETA_DESCARGA_APP, parent=self)
+        self.tarea.listo.connect(self._descargado)
+        self.tarea.fallo.connect(lambda m: self._detenido(f"✗ No se descargó: {m}", "error-texto"))
+        self.tarea.cancelado.connect(lambda: self._detenido("Descarga cancelada.", "suave"))
+        self.tarea.start()
+        self._timer.start()
+
+    def _drenar(self):
+        if self.tarea is None:
+            return
+        _, avance = self.tarea.tomar()
+        if avance:
+            actual, total, texto = avance
+            if total:
+                self.barra.setRange(0, 1000)
+                self.barra.setValue(int(actual * 1000 / total))
+            else:
+                self.barra.setRange(0, 0)
+            if texto:
+                self._estado(texto, "suave")
+
+    def _fin_tarea(self):
+        self._timer.stop()
+        if self.tarea is not None:
+            self.tarea.wait()
+            self.tarea = None
+        self.barra.hide()
+
+    def _detenido(self, texto: str, clase: str):
+        self._fin_tarea()
+        self._estado(texto, clase)
+        self._activar(True)
+        self.btn_instalar.setText("Reintentar")
+
+    def _descargado(self, r: dict):
+        self._fin_tarea()
+        tipo, texto_firma = evaluar_firma_instalador(r["firmas"])
+        marca = {"ok": "✓", "info": "•", "aviso": "⚠", "error": "✗"}[tipo]
+        lineas = "✓ Tamaño y SHA256 iguales a los que publica GitHub.\n" + f"{marca} {texto_firma}"
+        if tipo == "error":
+            try:
+                Path(r["ruta"]).unlink()
+            except OSError:
+                pass
+            self._detenido(lineas + "\nNo se instala.", "error-texto")
+            self.btn_instalar.setEnabled(False)
+            return
+        firma_valida = bool(r["firmas"]) and (r["firmas"][0] or {}).get("Estado") == "Valid"
+        if control_inteligente_activo() and not firma_valida and QMessageBox.question(
+                self, APP_NOMBRE, "El Control inteligente de aplicaciones de Windows está activado y el instalador "
+                                  "no tiene una firma que Windows reconozca: lo más probable es que lo bloquee.\n\n"
+                                  "¿Intentarlo de todos modos?") != QMessageBox.StandardButton.Yes:
+            self._detenido(lineas + "\nNo se instaló: descárgalo desde su página de GitHub.", "aviso")
+            return
+        self._estado(lineas + "\nCerrando la app para instalar…", "ok")
+        self._instalar(r)
+
+    def _instalar(self, r: dict):
+        silencioso = self.rb_sola.isChecked()
+        version = self.release["version"]
+        try:
+            CARPETA_REGISTROS.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        script = script_ayudante_actualizar(
+            r["ruta"], r["sha256"], argumentos_instalador(silencioso, CARPETA_REGISTROS / f"instalacion_v{version}.log"),
+            os.getpid(), comando_de_la_app()[0], version, silencioso)
+        motivo = lanzar_ayudante_actualizar(script)
+        if motivo:
+            self._detenido(f"✗ No se pudo abrir el instalador: {motivo}", "error-texto")
+            return
+        self.accept()
+        QTimer.singleShot(0, self.ventana.cerrar_para_actualizar)
+
+    def reject(self):
+        if self.tarea is not None:          # primero se cancela la descarga; el diálogo sigue abierto
+            self.tarea.cancelar()
+            return
+        super().reject()
+
+
 HERRAMIENTAS = [
     ("Copiar", "Robocopy con exclusiones, % y tiempo restante, multihilo según el disco."),
     ("Organizar", "Mueve o copia archivos a una carpeta por extensión, sin sobrescribir."),
@@ -8344,6 +9953,34 @@ class PaginaAcerca(QWidget):
             lay.addWidget(w)
         fila.addWidget(autor, 2)
         v.addLayout(fila)
+
+        # ─── Versión nueva en GitHub ───
+        act = ventana.actualizador
+        card, lay = tarjeta("Actualizaciones de la app")
+        self.lbl_version_app = etiqueta("", "suave")
+        self.lbl_version_app.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self.lbl_version_app)
+        self.chk_buscar_al_abrir = QCheckBox("Buscar versiones nuevas al abrir la app (una consulta a GitHub, "
+                                             "como mucho una vez al día)")
+        self.chk_buscar_al_abrir.setChecked(bool(act.cfg.get("buscar_al_abrir")))
+        self.chk_buscar_al_abrir.toggled.connect(act.cambiar_buscar_al_abrir)
+        lay.addWidget(self.chk_buscar_al_abrir)
+        botones = QHBoxLayout()
+        botones.setSpacing(SPACING_SM)
+        self.btn_buscar_version = boton("Buscar ahora", tooltip="Consulta la última versión publicada en GitHub")
+        self.btn_buscar_version.clicked.connect(act.buscar)
+        botones.addWidget(self.btn_buscar_version)
+        self.btn_ver_version = boton("Ver y actualizar", "primario")
+        self.btn_ver_version.clicked.connect(ventana.abrir_actualizacion)
+        botones.addWidget(self.btn_ver_version)
+        b = boton("Versiones en GitHub", "fantasma", f"{APP_REPO}/releases")
+        b.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(f"{APP_REPO}/releases")))
+        botones.addWidget(b)
+        botones.addStretch(1)
+        lay.addLayout(botones)
+        v.addWidget(card)
+        act.cambio.connect(self._refrescar_version)
+        self._refrescar_version()
 
         # ─── Herramientas ───
         card, lay = tarjeta("Herramientas")
@@ -8430,6 +10067,18 @@ class PaginaAcerca(QWidget):
         pie.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(pie)
 
+    def _refrescar_version(self):
+        act = self.ventana.actualizador
+        texto, clase = act.texto_estado()
+        self.lbl_version_app.setText(texto)
+        self.lbl_version_app.setProperty("class", clase)
+        refrescar_estilo(self.lbl_version_app)
+        self.btn_buscar_version.setEnabled(not act.buscando)
+        nueva = act.nueva()
+        self.btn_ver_version.setVisible(nueva is not None)
+        if nueva is not None:
+            self.btn_ver_version.setText(f"Ver y actualizar a la {nueva['version']}")
+
     @staticmethod
     def _abrir_registros():
         try:
@@ -8467,6 +10116,7 @@ class VentanaPrincipal(QMainWindow):
     def __init__(self, app: QApplication, config: Config):
         super().__init__()
         self.app, self.config = app, config
+        self.actualizador = ActualizadorApp(config, self)
         # Como cmd: «Administrador:» delante del título si tiene esos permisos
         self.setWindowTitle(("Administrador: " if es_administrador() else "") + f"{APP_NOMBRE} {APP_VERSION}")
         self.setMinimumSize(900, 560)
@@ -8512,6 +10162,9 @@ class VentanaPrincipal(QMainWindow):
         self.btn_tema.clicked.connect(self.alternar_tema)
         h.addWidget(self.btn_tema)
         v.addWidget(barra)
+        self.aviso_app = AvisoApp()
+        v.addWidget(self.aviso_app)
+        self.actualizador.cambio.connect(self._refrescar_aviso_app)
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -8570,8 +10223,11 @@ class VentanaPrincipal(QMainWindow):
         self.resize(ancho, alto)
         self.move(area.x() + (area.width() - ancho) // 2, area.y() + (area.height() - alto) // 2)
 
+    def tareas_en_curso(self) -> list[str]:
+        return [n for n, p in self.paginas if p.ocupada()]
+
     def closeEvent(self, e):
-        ocupadas = [n for n, p in self.paginas if p.ocupada()]
+        ocupadas = self.tareas_en_curso()
         if ocupadas:
             r = QMessageBox.question(
                 self, APP_NOMBRE,
@@ -8593,7 +10249,7 @@ class VentanaPrincipal(QMainWindow):
 
     def reabrir_como_admin(self) -> bool:
         """Abre otra copia con permisos de administrador y cierra esta. False si no se pudo (o se rechazó)."""
-        ocupadas = [n for n, p in self.paginas if p.ocupada()]
+        ocupadas = self.tareas_en_curso()
         if ocupadas:
             QMessageBox.information(self, APP_NOMBRE, f"Espera a que termine lo que está en curso "
                                                       f"({', '.join(ocupadas)}) para reabrir la app.")
@@ -8610,6 +10266,51 @@ class VentanaPrincipal(QMainWindow):
         pagina = dict(self.paginas)["Actualizaciones"]
         self.tabs.setCurrentWidget(pagina)
         pagina.tras_reabrir()
+
+    # ─── Versión nueva de la app ───
+    def _refrescar_aviso_app(self):
+        if self.aviso_app.tipo in ("ok", "aviso"):      # cómo terminó la actualización: se queda hasta cerrarlo
+            return
+        nueva = self.actualizador.nueva()
+        if nueva is None or not self.actualizador.debe_avisar():
+            self.aviso_app.ocultar()
+            return
+        self.aviso_app.mostrar(
+            f"⬆  Hay una versión nueva: {nueva['version']} (tienes la {APP_VERSION}).", "info",
+            [("Ver y actualizar", "primario", self.abrir_actualizacion),
+             ("Más tarde", None, self.actualizador.posponer),
+             ("Omitir esta versión", None, self.actualizador.omitir)])
+
+    def abrir_actualizacion(self):
+        nueva = self.actualizador.nueva()
+        if nueva is not None:
+            DialogoActualizarApp(self, nueva).exec()
+
+    def cerrar_para_actualizar(self):
+        """El ayudante ya espera a que la app se cierre para abrir el instalador."""
+        self.close()
+
+    def tras_actualizar(self, version: str, codigo: str):
+        """Al volver a abrirse tras el instalador: si quedó la versión nueva o qué pasó."""
+        if (comparar_versiones(APP_VERSION, version) or 0) >= 0 and numeros_de_version(version):
+            shutil.rmtree(CARPETA_DESCARGA_APP, ignore_errors=True)
+            release = self.actualizador.release()
+            botones = []
+            if release is not None and comparar_versiones(release["version"], APP_VERSION) == 0:
+                botones.append(("Novedades", None, lambda: ver_novedades(self, release)))
+            self.aviso_app.mostrar(f"✓  Se actualizó a la versión {APP_VERSION}.", "ok",
+                                   botones + [("Cerrar", None, self.aviso_app.ocultar)])
+            return
+        motivo = CODIGOS_INSTALADOR.get(codigo) or (f"el instalador terminó con el código {codigo}" if codigo
+                                                    else "no se supo cómo terminó el instalador")
+        registro = CARPETA_REGISTROS / f"instalacion_v{version}.log"
+        botones = []
+        if registro.is_file():
+            botones.append(("Ver registro", None, lambda: abrir_en_sistema(registro)))
+        if self.actualizador.nueva() is not None:
+            botones.append(("Reintentar", "primario", self.abrir_actualizacion))
+        self.aviso_app.mostrar(f"⚠  No se actualizó a la {version}: {motivo}. Sigues con la {APP_VERSION}.", "aviso",
+                               botones + [("Cerrar", None, self.aviso_app.ocultar)])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -8718,6 +10419,71 @@ def autoprueba(app: QApplication, ventana: VentanaPrincipal) -> int:
         (origen / "documento.pdf").write_bytes(b"%PDF")
         (origen / "foto.JPG").write_bytes(b"jpg")
 
+        # 0. Sesiones: «sin guardar» solo si de verdad cambió algo respecto a la sesión elegida
+        def sesiones():
+            for _ in range(100):            # que termine la detección de discos de Copiar
+                app.processEvents()
+                time.sleep(0.01)
+            detalle = {}
+            for nombre in ("Copiar", "Listar rutas", "Licencias"):
+                if nombre not in pag:
+                    continue
+                b = pag[nombre].sesiones
+                al_abrir = b.modificado()
+                b._sesiones()["autoprueba"] = b.obtener_estado()
+                b._rellenar("autoprueba")
+                b._aplicar("autoprueba")
+                cargada = b.modificado()
+                campo = pag[nombre].nombre_salida if hasattr(pag[nombre], "nombre_salida") else pag[nombre].txt_extra
+                antes = campo.text()
+                campo.setText(antes + "_x")
+                cambiada = b.modificado()
+                campo.setText(antes)
+                deshecha = b.modificado()
+                campo.setText(antes + "_y")
+                b.guardar()
+                guardada = b.modificado()
+                campo.setText(antes)
+                b._sesiones().pop("autoprueba", None)
+                b._rellenar(PREDETERMINADA)
+                b._aplicar(PREDETERMINADA)
+                detalle[nombre] = [al_abrir, cargada, cambiada, deshecha, guardada]
+            p = pag["Copiar"]
+            p.chk_mt.setChecked(True)
+            p.chk_auto.setChecked(True)
+            p.sesiones._tomar_referencia()
+            p.sp_hilos.setValue(p.sp_hilos.value() % 16 + 1)     # lo que hace la detección del disco
+            detalle["hilos_auto"] = p.sesiones.modificado()
+            p.sesiones._aplicar(PREDETERMINADA)
+            esperado = [False, False, True, False, False]
+            registrar("sesiones", all(v == esperado for k, v in detalle.items() if k != "hilos_auto")
+                      and detalle["hilos_auto"] is False,
+                      orden="al abrir, cargada, cambiada, deshecha, guardada", **detalle)
+        probar("sesiones", sesiones)
+
+        # 0b. La tabla final de robocopy en palabras (sin /BYTES: «29.371 g»)
+        def tabla_robocopy():
+            t = leer_tabla_robocopy(
+                "               Total   Copiado   OmitidoNo coincidencia     ERROR    Extras\n"
+                "Director.:      1866      1817       271         0         0       845\n"
+                " Archivos:     12675      9713      2962         0         0      5766\n"
+                "    Bytes:  29.371 g  26.965 g   2.406 g         0         0  14.887 g\n"
+                "   Tiempo:   0:00:03   0:00:00                       0:00:00   0:00:03\n")
+            filas = {}
+            if t:
+                for linea in resumen_robocopy(t, True, None)[0]:
+                    celdas = [x.strip() for x in "".join(texto for texto, _ in linea).split("│")[1:-1]]
+                    if celdas:
+                        filas[celdas[0]] = celdas[1:]
+            tiempos = leer_tiempos_robocopy("   Tiempo:   0:01:03   0:00:40                       0:00:00   0:00:03\n"
+                                            "   Finalizado: viernes, 30 de octubre de 2026 04:55:30 p. m.\n")
+            registrar("robocopy_tabla", bool(t) and filas.get("se copiaría (nuevo o cambiado)") == ["1,595", "9,713", "27.0 GB"]
+                      and filas.get("Solo en el destino: se queda") == ["845", "5,766", "14.9 GB"]
+                      and filas.get("CÓMO QUEDARÍA EL DESTINO") == ["2,711", "18,441", "44.3 GB"]
+                      and bool(tiempos) and tiempos["total"] == 63 and tiempos["copiando"] == 40
+                      and "2026" in (tiempos["fin"] or ""), filas=filas, tiempos=tiempos)
+        probar("robocopy_tabla", tabla_robocopy)
+
         # 1. Copiar (robocopy)
         def copiar():
             p = pag["Copiar"]
@@ -8755,11 +10521,13 @@ def autoprueba(app: QApplication, ventana: VentanaPrincipal) -> int:
             p.consola._vaciar()
             texto = p.consola.toPlainText()
             p.txt_extra.setText("")
+            fila_borrado = next((linea for linea in texto.splitlines() if "se BORRÓ (/MIR)" in linea), "")
             registrar("copiar_mir", terminado and not (destino / "carpeta_sobra").exists()
                       and (destino / "__pycache__" / "cache.pyc").exists()
-                      and "Borrado del destino (/MIR): 1 archivo(s) (10 B) y 1 carpeta(s)" in texto
-                      and "no se tocaron" not in texto,
-                      archivos_copiados=sum(1 for _ in destino.rglob("*.txt")))
+                      and re.search(r"│\s+1 │\s+1 │\s+10 B │", fila_borrado) is not None
+                      and "CÓMO QUEDÓ EL DESTINO" in texto and "no se tocaron" not in texto
+                      and "Se BORRÓ del destino" in texto,
+                      archivos_copiados=sum(1 for _ in destino.rglob("*.txt")), fila_borrado=fila_borrado.strip())
         if ES_WINDOWS:
             probar("copiar_mir", copiar_mir)
 
@@ -8870,6 +10638,18 @@ def autoprueba(app: QApplication, ventana: VentanaPrincipal) -> int:
                 fallos.append("Avast no detectado")
             if interceptor_https("CN=Microsoft Azure RSA TLS Issuing CA 07, O=Microsoft Corporation, C=US"):
                 fallos.append("certificado de Microsoft tomado por interceptado")
+            # Avast inspeccionando: con y sin BypassCertificatePinningForMicrosoftStore
+            datos = {"Winget": "winget", "Usado": "winget",
+                     "Tls": {HOSTS_TLS[0]: "CN=Avast Web/Mail Shield Root, O=Avast Web/Mail Shield"},
+                     "Ajustes": json.dumps({"adminSettings": {"InstallerHashOverride": False, AJUSTE_PINNING_STORE: True}})}
+            seg = evaluar_seguridad(datos)
+            if not (seg["sin_pinning_store"] and seg.get("https_interceptado") == "Avast"
+                    and any("funciona igual" in t for _, t in seg["comprobaciones"])):
+                fallos.append("Store permitida con Avast")
+            datos["Ajustes"] = json.dumps({"adminSettings": {"InstallerHashOverride": False}})
+            seg = evaluar_seguridad(datos)
+            if seg["sin_pinning_store"] or not any("Permitir la Store" in t for _, t in seg["comprobaciones"]):
+                fallos.append("Store bloqueada por Avast")
             comprimido = tmp / "paquete.zip"
             with zipfile.ZipFile(comprimido, "w") as z:
                 z.writestr("carpeta/setup.exe", b"MZ" + b"0" * 4096)
@@ -8920,6 +10700,162 @@ def autoprueba(app: QApplication, ventana: VentanaPrincipal) -> int:
             ocupado = windows_installer_ocupado()       # solo que no truene
             registrar("actualizaciones_ayudas", not fallos, fallos=fallos, windows_installer_ocupado=ocupado)
         probar("actualizaciones_ayudas", ayudas_winget)
+
+        # 6c. Finalizar sin preguntar lo que tiene abierto un programa: con una copia de ping.exe propia,
+        # lanzada desde una carpeta temporal (nunca se toca otro proceso)
+        def finalizar_abiertos():
+            pa = pag["Actualizaciones"]
+            carpeta = tmp / "programa abierto"
+            carpeta.mkdir()
+            exe = carpeta / "programa_prueba.exe"
+            shutil.copy(Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "PING.EXE", exe)
+            proc = subprocess.Popen([str(exe), "-n", "120", "127.0.0.1"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=FLAGS_SIN_VENTANA)
+            falso = {"nombre": "Programa de prueba", "instalado": {"carpeta": str(carpeta)}}
+            resultado = {}
+
+            def flujo():
+                resultado["respuesta"] = yield from pa._revisar_abiertos("", falso, "[prueba]", auto=True)
+            try:
+                time.sleep(0.5)
+                pa._iniciar_flujo(flujo(), "prueba", "Probando…")
+                esperar(pa, 120)
+                for _ in range(30):
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                vivo = proc.poll() is None
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+            registrar("actualizaciones_finalizar",
+                      resultado.get("respuesta") == "seguir" and not vivo and falso.get("finalizados") == [exe.stem],
+                      respuesta=resultado.get("respuesta"), finalizados=falso.get("finalizados"), sigue_abierto=vivo)
+        if ES_WINDOWS:
+            probar("actualizaciones_finalizar", finalizar_abiertos)
+
+        # 6d. Preparación en paralelo: el segundo carril (hilo, pausa y PowerShell) y dejar una descarga
+        # donde winget la reutiliza (una carpeta propia en %TEMP%\WinGet, que se borra al final)
+        def preparacion_paralela():
+            import hashlib
+            pa = pag["Actualizaciones"]
+            fallos = []
+            resultado = {}
+
+            def flujo():
+                resultado["hilo"] = yield EnHilo(lambda: 6 * 7)
+                yield Pausa(0.1)
+                r = yield pa._powershell(f"'{MARCA_JSON}' + (ConvertTo-Json -InputObject @(1, 2) -Compress)", 60)
+                resultado["ps"] = r.datos
+                yield Pausa(30)                 # aquí se corta: detener() no debe esperar
+                resultado["no_debia"] = True
+            pa._carril.iniciar(flujo())
+            limite = time.monotonic() + 60
+            while "ps" not in resultado and time.monotonic() < limite:
+                app.processEvents()
+                time.sleep(0.01)
+            pa._carril.detener()
+            if resultado.get("hilo") != 42 or resultado.get("ps") != [1, 2] or "no_debia" in resultado \
+                    or pa._carril.activo():
+                fallos.append(f"carril: {resultado}")
+            archivo = tmp / "instalador_prueba.exe"
+            archivo.write_bytes(b"MZ prueba" * 100)
+            sha = hashlib.sha256(archivo.read_bytes()).hexdigest()
+            guardado = guardar_para_winget(archivo, "UtilidadesArchivos.Autoprueba", f"0.0.{os.getpid()}")
+            ruta = Path(guardado["ruta"]) if guardado else None
+            if ruta is None or ruta.name != sha or ruta.parent.parent != carpeta_temporal_winget() or archivo.exists():
+                fallos.append(f"guardar: {guardado}")
+            borrar_guardado_winget(guardado)
+            if ruta is not None and (ruta.exists() or ruta.parent.exists()):
+                fallos.append("no se borró lo guardado")
+            if guardar_para_winget(archivo, "Mal:Id", "1.0") is not None:
+                fallos.append("Id con «:» aceptado")
+            registrar("actualizaciones_paralelo", not fallos, fallos=fallos)
+        probar("actualizaciones_paralelo", preparacion_paralela)
+
+        # 6e. Actualizar la app desde GitHub, sin internet: una release y un instalador falsos (file://).
+        # No se lanza el ayudante ni se instala nada
+        def actualizar_app():
+            import hashlib
+            fallos = []
+            falso = tmp / "UtilidadesArchivos_Setup_v99.0.0.exe"
+            falso.write_bytes(b"MZ instalador de prueba" * 4000)
+            sha = hashlib.sha256(falso.read_bytes()).hexdigest()
+            datos = {"tag_name": "v99.0.0", "name": "Prueba", "body": "## Novedades\n- algo", "draft": False,
+                     "prerelease": False, "published_at": "2026-11-01T10:00:00Z", "html_url": f"{APP_REPO}/releases",
+                     "assets": [{"name": "otra_cosa.zip", "size": 1, "browser_download_url": f"{APP_REPO}/x.zip"},
+                                {"name": falso.name, "size": falso.stat().st_size, "digest": f"sha256:{sha}",
+                                 "browser_download_url": falso.as_uri()}]}
+            (tmp / "release.json").write_text(json.dumps(datos), encoding="utf-8")
+            antes = os.environ.get(VARIABLE_RELEASE_PRUEBA)
+            os.environ[VARIABLE_RELEASE_PRUEBA] = (tmp / "release.json").as_uri()
+            act = ventana.actualizador
+            try:
+                for a, b, esperado in (("1.10.0", "1.9.9", 1), ("1.3", "1.3.0", 0), ("v1.2.0", "1.3.0", -1)):
+                    if comparar_versiones(a, b) != esperado:
+                        fallos.append(f"comparar {a} {b}")
+                if leer_release(dict(datos, prerelease=True)) is not None:
+                    fallos.append("prerelease aceptada")
+                # La consulta, como la de al abrir: aviso arriba y botón en «Acerca de»
+                act.buscar()
+                limite = time.monotonic() + 20
+                while act.buscando and time.monotonic() < limite:
+                    app.processEvents()
+                    time.sleep(0.01)
+                app.processEvents()
+                nueva = act.nueva() or {}
+                if nueva.get("version") != "99.0.0" or (nueva.get("instalador") or {}).get("sha256") != sha:
+                    fallos.append(f"consulta: {act.error or nueva}")
+                if ventana.aviso_app.tipo != "info" or ventana.pagina_acerca.btn_ver_version.isHidden():
+                    fallos.append("sin aviso de la versión nueva")
+                # Descarga comprobada; con otro SHA256 se rechaza y no queda nada
+                for sha_pedido, debe_fallar in ((sha, False), ("0" * 64, True)):
+                    resultado = {}
+                    t = Tarea(descargar_instalador_app, dict(nueva["instalador"], sha256=sha_pedido), tmp / "descarga")
+                    t.listo.connect(lambda r, d=resultado: d.update(r))
+                    t.fallo.connect(lambda m, d=resultado: d.update(error=m))
+                    t.start()
+                    limite = time.monotonic() + 120
+                    while "error" not in resultado and "ruta" not in resultado and time.monotonic() < limite:
+                        app.processEvents()
+                        time.sleep(0.01)
+                    t.wait()
+                    quedan = [x.name for x in (tmp / "descarga").iterdir()]
+                    if debe_fallar and ("SHA256" not in resultado.get("error", "") or quedan):
+                        fallos.append(f"SHA256 distinto: {resultado}, quedan {quedan}")
+                    if not debe_fallar and (resultado.get("sha256") != sha or quedan != [falso.name]):
+                        fallos.append(f"descarga: {resultado}")
+                if host_permitido("https://example.com/x.exe") or not host_permitido(
+                        "https://release-assets.githubusercontent.com/x"):
+                    fallos.append("host_permitido")
+                propia = {"Estado": "Valid", "Huella": "AA", "Firmante": "CN=Prueba"}
+                if evaluar_firma_instalador([{"Estado": "NotSigned"}, propia])[0] != "error" \
+                        or evaluar_firma_instalador([propia, propia])[0] != "ok" \
+                        or evaluar_firma_instalador([{"Estado": "HashMismatch"}])[0] != "error":
+                    fallos.append("evaluar_firma_instalador")
+                args = argumentos_instalador(True, Path(r"C:\con espacios\x.log"))
+                script = script_ayudante_actualizar(str(falso), sha, args, 1234, "app.exe", "99.0.0", True)
+                if '/LOG="C:\\con espacios\\x.log"' not in args or "/SILENT" not in args or any(
+                        x not in script for x in ("Wait-Process -Id 1234", "Get-FileHash", sha.upper(), "99.0.0:")):
+                    fallos.append("argumentos o ayudante")
+                if resultado_de_actualizacion(["x", f"{ARG_ACTUALIZACION}99.0.0:0"]) != ("99.0.0", "0"):
+                    fallos.append("resultado_de_actualizacion")
+                ventana.tras_actualizar("99.0.0", "1")
+                if ventana.aviso_app.tipo != "aviso":
+                    fallos.append("aviso de actualización fallida")
+                ventana.tras_actualizar(APP_VERSION, "0")
+                if ventana.aviso_app.tipo != "ok":
+                    fallos.append("aviso de actualización correcta")
+            finally:
+                if antes is None:
+                    os.environ.pop(VARIABLE_RELEASE_PRUEBA, None)
+                else:
+                    os.environ[VARIABLE_RELEASE_PRUEBA] = antes
+                act.cfg.update(copy.deepcopy(DEFAULT_ACTUALIZAR_APP))
+                ventana.aviso_app.ocultar()
+            registrar("actualizar_app", not fallos, fallos=fallos)
+        probar("actualizar_app", actualizar_app)
 
         # 7. Actualizaciones con el winget real: solo lectura (seguridad y lista), sin instalar nada
         def analisis_winget():
@@ -9104,6 +11040,10 @@ def main():
     ventana.show()
     if ARG_REABIERTO in sys.argv:
         ventana.tras_reabrir()
+    actualizacion = resultado_de_actualizacion(sys.argv)
+    if actualizacion:
+        ventana.tras_actualizar(*actualizacion)
+    ventana.actualizador.al_abrir()
     sys.exit(app.exec())
 
 

@@ -4,7 +4,7 @@
 
 App de escritorio para Windows (PyQt6) con utilidades para copiar, ordenar y documentar archivos y entornos de Python, más un actualizador de programas con winget que revisa cada instalador antes de ejecutarlo.
 
-**Versión 1.2.0** · Creada por **DoMiNaTh0R** (Kevin González) · © 2026 · Licencia [GNU GPL v3](LICENSE)
+**Versión 1.3.0** · Creada por **DoMiNaTh0R** (Kevin González) · © 2026 · Licencia [GNU GPL v3](LICENSE)
 
 Para instalarla o compilarla, mira **[INSTALL.md](INSTALL.md)**.
 
@@ -12,13 +12,13 @@ Para instalarla o compilarla, mira **[INSTALL.md](INSTALL.md)**.
 
 | Pestaña | Qué hace |
 |---|---|
-| **Copiar** | Robocopy con carpetas y archivos a omitir, simulación y salida en vivo, con %, velocidad y tiempo restante. Elige los hilos según el disco (USB, HDD o SSD). Con `/MIR` o `/PURGE` te enseña antes qué se borraría del destino y pregunta. |
+| **Copiar** | Robocopy con carpetas y archivos a omitir, simulación y salida en vivo, con %, velocidad y tiempo restante. Elige los hilos según el disco (USB, HDD o SSD). Con `/MIR` o `/PURGE` te enseña antes qué se borraría del destino y pregunta. Al terminar, una tabla con lo que hay en el origen, lo que se copia, lo que se omite, lo que solo está en el destino y cómo queda el destino, más otra con los tiempos. |
 | **Organizar** | Cuenta los archivos de una carpeta por extensión y mueve o copia los que elijas a `<destino>\<extensión>\`, sin sobrescribir nada. |
 | **Listar rutas** | Un `.txt` con las rutas de archivos y carpetas, con filtros por extensión y carpetas a ignorar. |
 | **Info entorno** | Python y paquetes de un venv, un entorno de conda o el Python global, y su `requirements.txt` (en conda, también `environment.yml`). Lo de conda y el global se guarda en el Escritorio. |
 | **Licencias** | `THIRD_PARTY_NOTICES.txt` con la licencia completa de cada paquete, con un JSON opcional para agregar componentes externos. |
 | **Actualizaciones** | Actualiza tus programas con winget, uno por uno, con verificación y reporte (abajo). |
-| **Acerca de** | Versión, licencia, dónde se guardan los datos y botones para abrirlos. |
+| **Acerca de** | Versión, licencia, dónde se guardan los datos y botones para abrirlos. Busca versiones nuevas de la app (abajo). |
 
 Todo corre en segundo plano: la ventana no se congela. Tema claro y oscuro, y sesiones con nombre en Copiar, Listar rutas y Licencias.
 
@@ -29,13 +29,19 @@ Todo corre en segundo plano: la ventana no se congela. Tema claro y oscuro, y se
 **Cada paquete** se verifica antes de instalarlo:
 - SHA256 y sitio de descarga del manifiesto, y el mismo SHA256 comparado con el que publica GitHub cuando el instalador viene de ahí.
 - Firma digital opcional (con PowerShell), también la de los instaladores que vienen dentro de un `.zip` o `.nupkg` y la de los paquetes MSIX. Para autores que no firman (como 7-Zip) hay una lista de «sin firma, pero confío».
-- Si el programa está abierto (te dice quién lo usa), si Windows Installer está ocupado (espera y reintenta) y si winget lo desinstalaría antes de instalar la versión nueva (pregunta antes).
+- Si el programa está abierto (te dice quién lo usa y puede finalizarlos por ti), si Windows Installer está ocupado (espera y reintenta) y si winget lo desinstalaría antes de instalar la versión nueva (pregunta antes). En «Opciones» puedes hacer que los finalice sin preguntar (desactivado de fábrica; al pulsar «Actualizar» te avisa). Nunca toca los procesos de Windows.
 
-**Durante la actualización** muestra el % real de cada descarga y en qué fase va. Al terminar vuelve a buscar y abre un reporte con la versión antes y después de cada programa, el motivo de cada fallo y un botón para reintentar.
+**Durante la actualización** instala de uno en uno, pero mientras instala uno ya va verificando y descargando los siguientes; winget reutiliza esa descarga (vuelve a comprobar su SHA256). Muestra el % real de cada descarga y en qué fase va. Al terminar vuelve a buscar y abre un reporte con la versión antes y después de cada programa, el motivo de cada fallo y un botón para reintentar.
 
 **Revisión manual:** lo de la Microsoft Store, de orígenes de terceros y las distribuciones de conda (Miniforge, Miniconda, Anaconda) nunca se actualizan en lote. Conda se actualiza con `conda update -n base --all`.
 
-También avisa si un antivirus inspecciona tus conexiones HTTPS (rompe la Microsoft Store en winget), indica si la app corre como administrador y puede reabrirla así sin perder lo que tenías marcado. Clic derecho en un paquete: copiar su enlace de descarga, el comando o el Id, o ignorarlo.
+También avisa si un antivirus inspecciona tus conexiones HTTPS (la Microsoft Store de winget exige el certificado de Microsoft) y te deja permitirlo en winget con un botón, indica si la app corre como administrador y puede reabrirla así sin perder lo que tenías marcado. Clic derecho en un paquete: copiar su enlace de descarga, el comando o el Id, o ignorarlo.
+
+## Versiones nuevas de la app
+
+Al abrirla consulta la última release de este repositorio (como mucho una vez al día, en segundo plano; se desactiva en **Acerca de**). Si hay una versión nueva, una franja arriba te deja verla, dejarla para más tarde u omitirla.
+
+**Actualizar** descarga el instalador de GitHub y comprueba su tamaño, el SHA256 que publica GitHub y su firma digital antes de abrirlo. Si la app está instalada con su instalador, se actualiza sola: se cierra, Windows pide permiso de administrador una vez, se instala sin preguntas y se vuelve a abrir diciendo cómo terminó. También puedes usar el asistente normal del instalador. Desde el código fuente o un `.exe` suelto te lleva a la página de la release.
 
 ## Datos de la app
 
